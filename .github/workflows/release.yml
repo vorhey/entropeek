@@ -15,7 +15,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag matches Cargo.toml
         env:
           TAG: ${{ github.ref_name }}
@@ -44,7 +44,7 @@ jobs:
           - { os: darwin, arch: amd64, target: x86_64-apple-darwin, runner: macos-latest }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -73,7 +73,7 @@ jobs:
           mkdir -p stage dist
           cp "target/${{ matrix.target }}/release/entropeek" LICENSE README.md stage/
           tar -czf "dist/entropeek_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" -C stage entropeek LICENSE README.md
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: entropeek-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
@@ -84,8 +84,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
