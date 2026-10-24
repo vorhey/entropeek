@@ -1,0 +1,124 @@
+name: release
+
+# Push a tag like v0.1.0 (matching the version in Cargo.toml) to build the
+# binaries, publish a GitHub release, and update the Homebrew tap.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test "v${version}" = "$TAG" || { echo "Cargo.toml says ${version}, tag is ${TAG}"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          # Linux builds link musl statically, so they run on any distribution.
+          - { os: linux, arch: amd64, target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
+          - { os: linux, arch: arm64, target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm }
+          - { os: darwin, arch: arm64, target: aarch64-apple-darwin, runner: macos-latest }
+          - { os: darwin, arch: amd64, target: x86_64-apple-darwin, runner: macos-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          bin="target/${{ matrix.target }}/release/entropeek"
+          test "$("$bin" --version)" = "entropeek ${TAG#v}"
+          "$bin" list >/dev/null
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          mkdir -p stage dist
+          cp "target/${{ matrix.target }}/release/entropeek" LICENSE README.md stage/
+          tar -czf "dist/entropeek_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" -C stage entropeek LICENSE README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: entropeek-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and Homebrew formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          (cd dist && sha256sum entropeek_*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          sh scripts/homebrew-formula.sh "$TAG" dist/SHA256SUMS > dist/entropeek.rb
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --verify-tag --generate-notes --title "entropeek ${TAG}"
+      - name: Update the Homebrew tap
+        # Needs a fine-grained token with contents:write on vorhey/homebrew-tap,
+        # saved as the HOMEBREW_TAP_TOKEN secret. Skipped when it is not set.
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping the tap (dist/entropeek.rb is attached to the release)."
+            exit 0
+          fi
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/vorhey/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp dist/entropeek.rb tap/Formula/entropeek.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/entropeek.rb
+          git diff --cached --quiet || git commit -m "entropeek ${TAG}"
+          git push

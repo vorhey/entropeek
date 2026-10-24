@@ -1,0 +1,40 @@
+[package]
+name = "entropeek"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast terminal UI to browse, preview, resume and delete coding-agent sessions (Claude Code, Codex)"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/vorhey/entropeek"
+homepage = "https://github.com/vorhey/entropeek"
+keywords = ["tui", "claude", "codex", "sessions", "ratatui"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "entropeek"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+dirs = "7.0"
+jiff = "0.2"
+memchr = "2.8"
+postcard = { version = "1.1", features = ["use-std"] }
+ratatui = "0.30"
+rayon = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+tempfile = "3.27"
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
