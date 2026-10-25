@@ -230,7 +230,15 @@ pub fn wrap(value: &str, max: usize) -> Vec<String> {
             lines.push(String::new());
             continue;
         }
+        // A line that fits is shown exactly as written (minus trailing
+        // spaces), however deeply it is indented.
+        let trimmed = raw.trim_end_matches(' ');
+        if trimmed.width() <= max && !trimmed.contains('\t') {
+            lines.push(trimmed.to_string());
+            continue;
+        }
         let content = raw.trim_start_matches(' ');
+        // Continuation lines repeat the indentation, up to half the width.
         let indent_w = (raw.len() - content.len()).min(max / 2);
         let indent = " ".repeat(indent_w);
         let mut line = indent.clone();
@@ -305,24 +313,7 @@ pub fn is_user_prompt(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
-    // Context agents inject as tagged blocks. Only a message that is made
-    // of the block (it also ends with a tag) is noise; a prompt that merely
-    // starts by quoting a tag is the user's.
-    const NOISE_TAGS: &[&str] = &[
-        "<environment_context>",
-        "<permissions instructions>",
-        "<collaboration_mode>",
-        "<apps_instructions>",
-        "<skills_instructions>",
-        "<user_instructions>",
-        "<system-reminder>",
-        "<local-command-",
-        "<command-name>",
-        "<command-message>",
-        "<turn_aborted>",
-        "<user-prompt-submit-hook>",
-    ];
-    if NOISE_TAGS.iter().any(|tag| text.starts_with(tag)) && text.trim_end().ends_with('>') {
+    if is_injected_envelope(text) {
         return false;
     }
     if text.starts_with("[Request interrupted by user") && text.trim_end().ends_with(']') {
@@ -344,6 +335,56 @@ pub fn is_user_prompt(text: &str) -> bool {
         }
     }
     true
+}
+
+/// Tag names agents use for context they inject into user messages. A name
+/// ending in `-` matches every tag that starts with it.
+const NOISE_TAGS: &[&str] = &[
+    "environment_context",
+    "permissions instructions",
+    "collaboration_mode",
+    "apps_instructions",
+    "skills_instructions",
+    "user_instructions",
+    "system-reminder",
+    "local-command-",
+    "command-name",
+    "command-message",
+    "turn_aborted",
+    "user-prompt-submit-hook",
+];
+
+/// Whether `text` consists only of complete tagged blocks
+/// (`<name>…</name>`, separated by whitespace), the first of which is one
+/// agents inject. A message that merely mentions or quotes such a tag, or
+/// has text of its own outside the blocks, is the user's. This is still a
+/// heuristic: a user could paste exactly such a block on its own.
+fn is_injected_envelope(text: &str) -> bool {
+    let mut rest = text.trim();
+    let mut first = true;
+    while !rest.is_empty() {
+        let Some(open) = rest.strip_prefix('<') else { return false };
+        let Some(end) = open.find('>') else { return false };
+        let name = &open[..end];
+        if name.is_empty() || name.contains(['<', '/']) {
+            return false;
+        }
+        if first {
+            let noise = NOISE_TAGS.iter().any(|tag| match tag.strip_suffix('-') {
+                Some(prefix) => name.starts_with(prefix) && name.len() > prefix.len(),
+                None => name == *tag,
+            });
+            if !noise {
+                return false;
+            }
+            first = false;
+        }
+        let close = format!("</{name}>");
+        let body = &open[end + 1..];
+        let Some(at) = body.find(&close) else { return false };
+        rest = body[at + close.len()..].trim_start();
+    }
+    !first
 }
 
 /// Largest index `<= index` that falls on a char boundary of `value`.
@@ -470,6 +511,10 @@ mod tests {
     fn wrap_splits_long_words_and_keeps_indent() {
         assert_eq!(wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap("    let x = 1;", 40), vec!["    let x = 1;"]);
+        // Deep indentation that fits is kept exactly.
+        assert_eq!(wrap("      x", 10), vec!["      x"]);
+        assert_eq!(wrap("          x", 16), vec!["          x"]);
+        assert_eq!(wrap("      x   ", 7), vec!["      x"], "trailing spaces are not shown");
         for line in wrap("supercalifragilistic expialidocious word", 7) {
             assert!(width(&line) <= 7, "{line:?}");
         }
@@ -510,7 +555,7 @@ mod tests {
     fn noise_messages_are_not_prompts() {
         assert!(is_user_prompt("fix the bug in main.rs"));
         assert!(!is_user_prompt(""));
-        assert!(!is_user_prompt("<environment_context>\n<cwd>/x</cwd>"));
+        assert!(!is_user_prompt("<environment_context>\n<cwd>/x</cwd>\n</environment_context>"));
         assert!(!is_user_prompt("<command-name>/model</command-name>"));
         assert!(!is_user_prompt("<local-command-stdout>ok</local-command-stdout>"));
         assert!(!is_user_prompt("[Request interrupted by user for tool use]"));
@@ -521,6 +566,22 @@ mod tests {
         assert!(is_user_prompt("<environment_context> shows up in my logs, why?"));
         assert!(is_user_prompt("<system-reminder> tags: how do they work"));
         assert!(is_user_prompt("[Request interrupted by user] means what?"));
+    }
+
+    #[test]
+    fn only_complete_injected_blocks_are_noise() {
+        // Several blocks, as Claude writes a slash command.
+        let command = "<command-name>/clear</command-name>\n  <command-message>clear</command-message>\n  <command-args></command-args>";
+        assert!(!is_user_prompt(command));
+        assert!(!is_user_prompt("<local-command-caveat>Caveat: x</local-command-caveat>"));
+        assert!(!is_user_prompt("<turn_aborted>\nThe user interrupted.\n</turn_aborted>"));
+        // Comparing tags, quoting XML, or adding words of one's own is a prompt.
+        assert!(is_user_prompt("<environment_context> vs <user_instructions>"));
+        assert!(is_user_prompt("<environment_context>"));
+        assert!(is_user_prompt("<system-reminder>x</system-reminder> why do I see this?"));
+        assert!(is_user_prompt("<environment_context><cwd>/x</cwd>"));
+        assert!(is_user_prompt("<div>hi</div>"), "an ordinary tag is not injected context");
+        assert!(is_user_prompt("<local->x</local->"));
     }
 
     #[test]

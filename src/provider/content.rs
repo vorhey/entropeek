@@ -80,6 +80,10 @@ struct RawBlock<'a> {
     input: Option<&'a RawValue>,
 }
 
+/// Block types that are an attachment (an image or a file). A user message
+/// with one is a prompt even without any text.
+pub const ATTACHMENT_KINDS: &[&str] = &["image", "input_image", "document", "file", "input_file"];
+
 /// Parses a `content` value. Unknown shapes yield empty content.
 pub fn extract(raw: &RawValue) -> Content {
     let json = raw.get();
@@ -97,7 +101,7 @@ pub fn extract(raw: &RawValue) -> Content {
             "tool_use" | "server_tool_use" => {
                 Some(Block::Tool(tool_summary(block.name.as_deref().unwrap_or("tool"), block.input)))
             }
-            "image" | "input_image" | "document" | "file" | "input_file" => Some(Block::Attachment),
+            kind if ATTACHMENT_KINDS.contains(&kind) => Some(Block::Attachment),
             "tool_result" => Some(Block::ToolResult),
             _ => None,
         })

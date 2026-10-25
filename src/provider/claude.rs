@@ -90,7 +90,8 @@ struct Markers {
     ai_title: Marker,
     custom_title: Marker,
     tool_result: Marker,
-    text: Marker,
+    /// Block types that make a user message a prompt: text or an attachment.
+    prompt_blocks: Vec<Marker>,
 }
 
 impl Markers {
@@ -100,8 +101,16 @@ impl Markers {
             ai_title: Marker::token("ai-title"),
             custom_title: Marker::token("custom-title"),
             tool_result: Marker::token("tool_result"),
-            text: Marker::token("text"),
+            prompt_blocks: std::iter::once("text")
+                .chain(super::content::ATTACHMENT_KINDS.iter().copied())
+                .map(Marker::token)
+                .collect(),
         }
+    }
+
+    /// Whether a user line with tool results might also hold a prompt.
+    fn may_hold_prompt(&self, line: &[u8]) -> bool {
+        self.prompt_blocks.iter().any(|m| m.in_line(line))
     }
 }
 
@@ -126,8 +135,9 @@ pub fn parse_meta(path: &Path, bytes: &[u8], stamp: FileStamp) -> Option<Session
         let is_user = markers.user.in_line(line);
         let is_title = markers.ai_title.in_line(line) || markers.custom_title.in_line(line);
         // Tool results are most of the user records and can be huge. One
-        // without any text block cannot carry a prompt, so skip it unparsed.
-        let result_only = is_user && markers.tool_result.in_line(line) && !markers.text.in_line(line);
+        // without any text or attachment block cannot carry a prompt, so
+        // skip it unparsed.
+        let result_only = is_user && markers.tool_result.in_line(line) && !markers.may_hold_prompt(line);
         if !(is_user || is_title) || result_only {
             continue;
         }
@@ -547,6 +557,38 @@ mod tests {
             ]
         );
         assert_eq!(turns[0].timestamp, parse_rfc3339_ms("2026-01-01T10:00:00Z"));
+    }
+
+    #[test]
+    fn a_tool_result_sent_with_an_image_is_a_prompt() {
+        let line = fx::user_content(
+            ID,
+            CWD,
+            "2026-01-01T10:00:00Z",
+            serde_json::json!([
+                {"type": "tool_result", "tool_use_id": "t1", "content": "done"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]),
+        );
+        let data = bytes(&[line]);
+        let s = parse_meta(&path(), &data, stamp()).expect("a session");
+        assert_eq!(s.user_turns, 1);
+        assert_eq!(s.first_prompt.as_deref(), Some("[1 attachment]"));
+        assert_eq!(parse_transcript(&data).len(), 1);
+        // A result on its own is still skipped.
+        let result = fx::user_content(
+            ID,
+            CWD,
+            "2026-01-01T10:00:00Z",
+            serde_json::json!([{"type": "tool_result", "tool_use_id": "t1", "content": "an image of text"}]),
+        );
+        assert_eq!(parse_meta(&path(), &bytes(&[result]), stamp()), None);
+    }
+
+    #[test]
+    fn comparing_tags_is_a_prompt() {
+        let data = bytes(&[fx::user(ID, CWD, "2026-01-01T10:00:00Z", "<environment_context> vs <user_instructions>")]);
+        assert_eq!(parse_meta(&path(), &data, stamp()).unwrap().user_turns, 1);
     }
 
     #[test]
