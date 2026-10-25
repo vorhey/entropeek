@@ -1,6 +1,6 @@
 [package]
 name = "entropeek"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast terminal UI to browse, preview, resume and delete coding-agent sessions (Claude Code, Codex)"
