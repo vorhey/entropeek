@@ -20,7 +20,7 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
-use super::app::{Msg, PreviewKey, ScanReport, WrapRequest};
+use super::app::{Msg, PreviewKey, ScanReport, WrapRequest, Wrapped};
 use super::view::transcript_lines;
 use crate::actions;
 use crate::cache::Cache;
@@ -224,7 +224,7 @@ impl Jobs {
             |a: &WrapRequest, b: &WrapRequest| a.key == b.key,
             |req: &WrapRequest| {
                 let lines = transcript_lines(&req.turns, req.agent, req.key.width as usize, req.theme);
-                Msg::Wrapped(req.key.clone(), Ok(Arc::new(lines)))
+                Msg::Wrapped(req.key.clone(), Ok(Wrapped::new(lines)))
             },
             |req, error| Msg::Wrapped(req.key.clone(), Err(error)),
             tx.clone(),
@@ -591,9 +591,10 @@ mod tests {
         };
         jobs.wrap(WrapRequest { key: key.clone(), turns, agent: AgentKind::Claude, theme: Default::default() });
         match recv(&rx) {
-            Msg::Wrapped(got, Ok(lines)) => {
+            Msg::Wrapped(got, Ok(wrapped)) => {
                 assert_eq!(got, key);
-                assert!(lines.len() > 100);
+                assert!(wrapped.lines.len() > 100);
+                assert!(wrapped.bytes > 0, "the size is measured on the worker");
             }
             _ => panic!("expected a wrapped transcript"),
         }

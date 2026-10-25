@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use entropeek::cache::Cache;
 use entropeek::env::Env;
 use entropeek::model::{AgentKind, Role, Session, Turn};
-use entropeek::tui::app::{App, Msg, PreviewKey};
+use entropeek::tui::app::{App, Msg, PreviewKey, Wrapped};
 use entropeek::tui::view;
 use entropeek::{index, provider, testkit};
 use ratatui::Terminal;
@@ -105,6 +105,43 @@ fn tui_stays_fast_with_10k_sessions() {
     }
 }
 
+/// Adopting a finished wrap, and the one it replaces being freed, happen
+/// on the input thread; with millions of short lines that used to take
+/// tens of milliseconds per result.
+#[test]
+#[ignore]
+fn adopting_huge_wraps_stays_cheap() {
+    let mut app = App::new(sessions(10), "/home/u".into(), 10_000_000, Box::new(|_| String::new()));
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    let session = app.preview_request(true).unwrap();
+    // One 2 MiB message of one-character lines: a million display lines.
+    let turns = vec![Turn { role: Role::Assistant, text: "x\n".repeat(1 << 20), timestamp: None }];
+    app.on_msg(Msg::Preview(PreviewKey::of(&session), Ok(Arc::new(turns))));
+    terminal.draw(|f| view::draw(f, &mut app)).unwrap();
+    let request = app.wrap_wanted.take().expect("a background wrap was requested");
+    // The worker's share, for several widths (a resize), done up front.
+    let results: Vec<(entropeek::tui::app::WrapKey, Wrapped)> = (24..36)
+        .map(|width| {
+            let mut key = request.key.clone();
+            key.width = width;
+            let lines = view::transcript_lines(&request.turns, request.agent, width as usize, request.theme);
+            assert!(lines.len() <= view::MAX_PREVIEW_LINES + 4, "{} lines", lines.len());
+            (key, Wrapped::new(lines))
+        })
+        .collect();
+    let mut results = results.into_iter();
+    let adopt = time("adopt a 100k-line wrap, retiring the last", 12, || {
+        let (key, wrapped) = results.next().unwrap();
+        app.on_msg(Msg::Wrapped(key, Ok(wrapped)));
+    });
+    assert!(adopt.max < Duration::from_millis(16), "adoption max {:?}", adopt.max);
+    let draw = time("draw with a 100k-line wrap", 100, || {
+        app.handle_key(key('j'));
+        terminal.draw(|f| view::draw(f, &mut app)).unwrap();
+    });
+    assert_interactive("draw", &draw);
+}
+
 #[test]
 #[ignore]
 fn big_transcripts_never_block_drawing() {
@@ -138,7 +175,7 @@ fn big_transcripts_never_block_drawing() {
     println!("{:<46} {wrap_time:>9.2?} ({} lines, on a worker)", "wrap 4 MB transcript", lines.len());
     assert!(wrap_time < Duration::from_secs(2), "wrapping took {wrap_time:?}");
 
-    app.on_msg(Msg::Wrapped(request.key, Ok(Arc::new(lines))));
+    app.on_msg(Msg::Wrapped(request.key, Ok(Wrapped::new(lines))));
     app.focus = entropeek::tui::app::Focus::Preview;
     let scroll = time("scroll preview + draw (wrapped)", 500, || {
         app.handle_key(key('j'));

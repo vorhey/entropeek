@@ -13,7 +13,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 
-use super::app::{App, Focus, PreviewKey, PreviewState, Row, StatusKind, WrapKey, WrapRequest, turns_bytes};
+use super::app::{App, Focus, PreviewKey, PreviewState, Row, StatusKind, WrapKey, WrapRequest, Wrapped, turns_bytes};
 use super::icons::{self, glyph};
 use super::theme::Theme;
 use crate::model::{AgentKind, Role, Session, Turn};
@@ -423,38 +423,125 @@ fn meta_lines(app: &App, session: &Session, width: usize) -> Vec<Line<'static>> 
 /// Turns a transcript into display lines wrapped to `width`. Pure, so it
 /// can run on a worker thread.
 pub fn transcript_lines(turns: &[Turn], agent: AgentKind, width: usize, t: Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    transcript_lines_within(turns, agent, width, t, MAX_PREVIEW_LINES)
+}
+
+/// Most display lines a preview holds. Each line is a few small objects;
+/// past this, only the newest part of the transcript is formatted (and
+/// `entropeek show` prints everything).
+pub const MAX_PREVIEW_LINES: usize = 100_000;
+
+/// [`transcript_lines`] with at most about `max_lines` lines. Turns are
+/// formatted newest first, so the work and memory stop at the limit even
+/// for a transcript of millions of short lines.
+pub fn transcript_lines_within(
+    turns: &[Turn],
+    agent: AgentKind,
+    width: usize,
+    t: Theme,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(2).max(1);
     if turns.is_empty() {
-        lines.push(Line::from(Span::styled("(no messages)", t.dim())));
+        return vec![Line::from(Span::styled("(no messages)", t.dim()))];
     }
-    for turn in turns {
+    // (is a tool line, lines), newest first.
+    let mut blocks: Vec<(bool, Vec<Line<'static>>)> = Vec::new();
+    let mut count = 0;
+    let mut omitted = false;
+    for turn in turns.iter().rev() {
+        if count >= max_lines {
+            omitted = true;
+            break;
+        }
         let (who, color) = match turn.role {
             Role::User => (format!("{}You", t.icon(glyph::USER, "")), t.accent),
             Role::Assistant => (format!("{}{}", t.icon(icons::agent(agent), ""), agent.display_name()), t.agent(agent)),
             Role::Tool => {
                 let icon = t.icon(glyph::WRENCH, "⚙ ");
-                lines.push(Line::from(Span::styled(
+                let line = Line::from(Span::styled(
                     format!("  {icon}{}", text::truncate(&turn.text, width.saturating_sub(4))),
                     t.dim(),
-                )));
+                ));
+                count += 1;
+                blocks.push((true, vec![line]));
                 continue;
             }
         };
-        if !lines.is_empty() {
-            lines.push(Line::default());
-        }
         let mut heading = vec![Span::styled(format!("▍{who}"), t.bold(color))];
         if let Some(ts) = turn.timestamp {
             heading.push(Span::styled(format!("  {}", timefmt::local(ts)), t.dim()));
         }
-        lines.push(Line::from(heading));
-        let body = if turn.text.contains('\t') { turn.text.replace('\t', "    ") } else { turn.text.clone() };
-        for line in text::wrap(&body, body_width) {
-            lines.push(Line::from(Span::styled(format!("  {line}"), t.text())));
+        let mut block = vec![Line::from(heading)];
+        let room = max_lines.saturating_sub(count + 2).max(1);
+        let (body, cut) = tail_of(&turn.text, room, body_width);
+        let body = if body.contains('\t') { body.replace('\t', "    ") } else { body.to_string() };
+        let mut wrapped = text::wrap(&body, body_width);
+        let cut = cut || wrapped.len() > room;
+        if wrapped.len() > room {
+            wrapped.drain(..wrapped.len() - room);
+        }
+        if cut {
+            block.push(Line::from(Span::styled("  …", t.dim())));
+        }
+        block.extend(wrapped.into_iter().map(|line| Line::from(Span::styled(format!("  {line}"), t.text()))));
+        count += block.len() + 1;
+        blocks.push((false, block));
+        if cut {
+            omitted = true;
+            break;
         }
     }
+    let mut lines = Vec::with_capacity(count + 2);
+    if omitted {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  (the start of this conversation is too long to preview; `entropeek show` prints everything; \
+                 showing the last {} lines)",
+                count
+            ),
+            t.dim(),
+        )));
+    }
+    for (tool, block) in blocks.into_iter().rev() {
+        if !tool && !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(block);
+    }
     lines
+}
+
+/// The end of `text` that can produce at most about `lines` lines of
+/// `width` cells, and whether anything before it was left out.
+fn tail_of(text: &str, lines: usize, width: usize) -> (&str, bool) {
+    let mut start = text.len();
+    let mut found = 0;
+    while found < lines {
+        match text[..start].rfind('\n') {
+            Some(at) => {
+                start = at;
+                found += 1;
+            }
+            None => return clip_bytes(text, lines, width),
+        }
+    }
+    let (tail, clipped) = clip_bytes(&text[start + 1..], lines, width);
+    (tail, clipped || start > 0)
+}
+
+/// At most the last `lines * width * 4` bytes of `text` (a line cannot
+/// hold more), cut at a character boundary.
+fn clip_bytes(text: &str, lines: usize, width: usize) -> (&str, bool) {
+    let most = lines.saturating_mul(width).saturating_mul(4);
+    if text.len() <= most {
+        return (text, false);
+    }
+    let mut at = text.len() - most;
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    (&text[at..], true)
 }
 
 /// The wrapped lines for a transcript at `width`. Small transcripts are
@@ -474,8 +561,9 @@ fn wrapped_transcript(
         return lines;
     }
     if turns_bytes(turns) <= INLINE_WRAP_BYTES {
-        let lines = Arc::new(transcript_lines(turns, agent, width as usize, t));
-        app.store_wrapped(wrap_key, lines.clone());
+        let wrapped = Wrapped::new(transcript_lines(turns, agent, width as usize, t));
+        let lines = wrapped.lines.clone();
+        app.store_wrapped(wrap_key, wrapped);
         return lines;
     }
     app.want_wrap(WrapRequest { key: wrap_key, turns: turns.clone(), agent, theme: t });
@@ -1297,7 +1385,7 @@ mod tests {
         assert_eq!(request.key.width, 61, "box width minus borders and padding");
         // What the worker would send back:
         let lines = transcript_lines(&request.turns, request.agent, request.key.width as usize, request.theme);
-        app.on_msg(Msg::Wrapped(request.key.clone(), Ok(Arc::new(lines))));
+        app.on_msg(Msg::Wrapped(request.key.clone(), Ok(Wrapped::new(lines))));
         let ready = screen(&mut app, 130, 30);
         assert!(ready.contains("0 word word"), "{ready}");
         // A resize shows the old wrap while the new width is prepared.

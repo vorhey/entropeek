@@ -132,7 +132,7 @@ pub enum Msg {
         result: Result<ScanReport, String>,
     },
     Preview(PreviewKey, Result<Arc<Vec<Turn>>, String>),
-    Wrapped(WrapKey, Result<Arc<Vec<Line<'static>>>, String>),
+    Wrapped(WrapKey, Result<Wrapped, String>),
     Deleted {
         session: Session,
         generation: u64,
@@ -174,32 +174,34 @@ impl<K: Clone + Eq + Hash, V: Clone> ByteLru<K, V> {
         Some(value)
     }
 
-    fn insert(&mut self, key: K, value: V, size: usize) {
-        self.remove(&key);
+    /// Adds an entry and returns the entries it pushed out (for the caller
+    /// to dispose of: freeing a large one takes time).
+    fn insert(&mut self, key: K, value: V, size: usize) -> Vec<V> {
+        let mut evicted: Vec<V> = self.remove(&key).into_iter().collect();
         self.map.insert(key.clone(), (value, size));
         self.order.push_back(key);
         self.bytes += size;
         while self.order.len() > 1 && (self.bytes > self.budget || self.order.len() > self.max_entries) {
             if let Some(old) = self.order.pop_front()
-                && let Some((_, size)) = self.map.remove(&old)
+                && let Some((value, size)) = self.map.remove(&old)
             {
                 self.bytes -= size;
+                evicted.push(value);
             }
         }
+        evicted
     }
 
-    fn remove(&mut self, key: &K) {
-        if let Some((_, size)) = self.map.remove(key) {
-            self.bytes -= size;
-            self.order.retain(|k| k != key);
-        }
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let (value, size) = self.map.remove(key)?;
+        self.bytes -= size;
+        self.order.retain(|k| k != key);
+        Some(value)
     }
 
-    fn retain(&mut self, keep: impl Fn(&K) -> bool) {
+    fn retain(&mut self, keep: impl Fn(&K) -> bool) -> Vec<V> {
         let gone: Vec<K> = self.order.iter().filter(|k| !keep(k)).cloned().collect();
-        for key in gone {
-            self.remove(&key);
-        }
+        gone.iter().filter_map(|key| self.remove(key)).collect()
     }
 
     fn touch(&mut self, key: &K) {
@@ -227,6 +229,50 @@ fn lines_bytes(lines: &[Line]) -> usize {
                 + l.spans.iter().map(|s| s.content.len() + std::mem::size_of::<ratatui::text::Span>()).sum::<usize>()
         })
         .sum()
+}
+
+/// Wrapped lines and their estimated size, measured where they were made
+/// (on the wrap worker for big transcripts), not on the input thread.
+#[derive(Clone, Debug)]
+pub struct Wrapped {
+    pub lines: Arc<Vec<Line<'static>>>,
+    pub bytes: usize,
+}
+
+impl Wrapped {
+    pub fn new(lines: Vec<Line<'static>>) -> Wrapped {
+        let bytes = lines_bytes(&lines);
+        Wrapped { lines: Arc::new(lines), bytes }
+    }
+}
+
+/// Values at least this big (in estimated bytes) are freed on a background
+/// thread: dropping a million small lines takes tens of milliseconds.
+const RETIRE_IN_BACKGROUND: usize = 1024 * 1024;
+
+/// Drops `value` without holding up the input thread when it is big. If
+/// the background thread cannot be started, it is dropped right here.
+fn retire<T: Send + 'static>(value: T, bytes: usize) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    type Garbage = Box<dyn Send>;
+    static REAPER: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Garbage>>>> = OnceLock::new();
+    if bytes < RETIRE_IN_BACKGROUND {
+        return;
+    }
+    let reaper = REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Garbage>();
+        std::thread::Builder::new()
+            .name(format!("{}reaper", super::jobs::WORKER_PREFIX))
+            .spawn(move || rx.into_iter().for_each(drop))
+            .ok()
+            .map(|_| Mutex::new(tx))
+    });
+    if let Some(tx) = reaper
+        && let Ok(tx) = tx.lock()
+    {
+        let _ = tx.send(Box::new(value));
+    }
 }
 
 /// Rendered preview lines for one transcript at one width.
@@ -964,8 +1010,12 @@ impl App {
                 match result {
                     Ok(turns) => {
                         // Older versions of this file are superseded.
-                        self.preview_cache.retain(|k| k.path != key.path || *k == key);
-                        self.preview_cache.insert(key.clone(), turns.clone(), turns_bytes(&turns));
+                        let mut gone = self.preview_cache.retain(|k| k.path != key.path || *k == key);
+                        gone.extend(self.preview_cache.insert(key.clone(), turns.clone(), turns_bytes(&turns)));
+                        for turns in gone {
+                            let bytes = turns_bytes(&turns);
+                            retire(turns, bytes);
+                        }
                         if current.as_ref() == Some(&key) {
                             self.preview = PreviewState::Ready(key, turns);
                         }
@@ -1101,14 +1151,23 @@ impl App {
 
     /// Remembers wrapped lines, and shows them if they belong to the
     /// selected transcript.
-    pub fn store_wrapped(&mut self, key: WrapKey, lines: Arc<Vec<Line<'static>>>) {
-        self.wrap_cache.retain(|k| k.preview.path != key.preview.path || k.preview == key.preview);
-        self.wrap_cache.insert(key.clone(), lines.clone(), lines_bytes(&lines));
+    /// Large values that leave the caches or the screen are freed in the
+    /// background (see [`retire`]), so handling a result stays cheap.
+    pub fn store_wrapped(&mut self, key: WrapKey, wrapped: Wrapped) {
+        let Wrapped { lines, bytes } = wrapped;
+        let mut gone = self.wrap_cache.retain(|k| k.preview.path != key.preview.path || k.preview == key.preview);
+        gone.extend(self.wrap_cache.insert(key.clone(), lines.clone(), bytes));
         if key.mode == self.theme.mode
             && key.icons == self.theme.icons
             && self.selected_session().map(PreviewKey::of).as_ref() == Some(&key.preview)
+            && let Some(old) = self.wrapped.replace(WrappedPreview { key, lines })
         {
-            self.wrapped = Some(WrappedPreview { key, lines });
+            gone.push(old.lines);
+        }
+        for lines in gone {
+            // An estimate from the length is enough to decide.
+            let estimate = lines.len() * (std::mem::size_of::<Line>() + std::mem::size_of::<ratatui::text::Span>());
+            retire(lines, estimate);
         }
     }
 
@@ -1800,8 +1859,7 @@ mod tests {
         assert!(app.wrap_wanted.take().is_some());
         app.want_wrap(request.clone());
         assert!(app.wrap_wanted.is_none(), "already requested");
-        let lines = Arc::new(vec![Line::from("x")]);
-        app.on_msg(Msg::Wrapped(request.key.clone(), Ok(lines)));
+        app.on_msg(Msg::Wrapped(request.key.clone(), Ok(Wrapped::new(vec![Line::from("x")]))));
         assert!(app.wrapped.is_some(), "the selected transcript's lines are shown");
         assert!(app.cached_wrap(&request.key).is_some());
     }
