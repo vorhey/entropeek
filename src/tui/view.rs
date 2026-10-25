@@ -22,8 +22,11 @@ use crate::timefmt;
 
 /// Width at which the preview moves beside the list instead of below it.
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 120;
-/// Body height below which a stacked preview is hidden.
-const STACKED_MIN_BODY: u16 = 14;
+/// Rows of session details above the transcript (see [`meta_lines`]).
+const PREVIEW_META_ROWS: u16 = 6;
+/// Transcript rows the preview must have to be shown at all. With fewer,
+/// it is hidden, and Tab opens the full-screen transcript instead.
+const MIN_TRANSCRIPT_ROWS: u16 = 3;
 /// Transcripts up to this size are wrapped while drawing; bigger ones on a
 /// worker (wrapping is roughly 10 ms per MB).
 pub const INLINE_WRAP_BYTES: usize = 256 * 1024;
@@ -40,7 +43,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let search_visible = app.searching || !app.query.is_empty();
     let fixed = 1 + u16::from(search_visible);
-    app.keys_fit = area.width >= 80 && area.height >= fixed + 1 + KEYS_BOX_HEIGHT + MIN_LIST_ROWS;
+    let side_by_side = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
+    let status_rows = |keys_box: bool| u16::from(keys_box && app.status.is_some());
+    let body_height = |keys_box: bool| {
+        area.height.saturating_sub(fixed + status_rows(keys_box) + if keys_box { KEYS_BOX_HEIGHT } else { 1 })
+    };
+    // The keys box gives way when it would leave the preview without a
+    // readable transcript, but leaving it out would not.
+    let wants_preview = app.show_preview && !app.zoom;
+    let crowds_preview = wants_preview
+        && transcript_rows(body_height(true), area.width, side_by_side) < MIN_TRANSCRIPT_ROWS
+        && transcript_rows(body_height(false), area.width, side_by_side) >= MIN_TRANSCRIPT_ROWS;
+    app.keys_fit = area.width >= 80 && area.height >= fixed + 1 + KEYS_BOX_HEIGHT + MIN_LIST_ROWS && !crowds_preview;
     let keys_box = app.keys_fit && app.show_keys;
     // With the keys box, a status message gets its own line above it;
     // otherwise it takes the place of the hint bar.
@@ -58,8 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if search_visible {
         draw_search(frame, search, app);
     }
-    let side_by_side = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
-    let fits = side_by_side || body.height >= STACKED_MIN_BODY;
+    let fits = transcript_rows(body.height, body.width, side_by_side) >= MIN_TRANSCRIPT_ROWS;
     app.set_preview_visible(app.zoom || (app.show_preview && fits));
     if app.zoom {
         draw_preview(frame, body, app);
@@ -87,6 +100,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(frame, area, app);
     }
+}
+
+/// Transcript rows the preview would get in a body of `height` rows: its
+/// share of the body, minus its border and the session details.
+fn transcript_rows(height: u16, width: u16, side_by_side: bool) -> u16 {
+    let body = Rect::new(0, 0, width, height);
+    let preview = if side_by_side {
+        body
+    } else {
+        let [_, preview] = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body);
+        preview
+    };
+    preview.height.saturating_sub(2 + PREVIEW_META_ROWS)
 }
 
 /// `entropeek  N sessions  [1 claude 21] [2 codex 3]  · tagline`, dropping
@@ -1060,6 +1086,25 @@ mod tests {
     }
 
     #[test]
+    fn a_shown_preview_always_has_readable_transcript_rows() {
+        for (w, h) in [(80, 18), (80, 20), (80, 22), (80, 24), (80, 26), (100, 30), (200, 10), (200, 12), (200, 30)] {
+            let mut app = app();
+            app.status = Some(super::super::app::Status { kind: StatusKind::Info, text: "x".into() });
+            render(&mut app, w, h);
+            if app.preview_visible {
+                assert!(app.preview_height >= MIN_TRANSCRIPT_ROWS as usize, "{w}x{h}: {} rows", app.preview_height);
+            } else {
+                app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+                assert!(app.zoom, "{w}x{h}: a hidden preview opens full-screen instead");
+            }
+        }
+        // The default 80x24 terminal shows the preview, without the keys box.
+        let mut app = app();
+        render(&mut app, 80, 24);
+        assert!(app.preview_visible && !app.keys_fit);
+    }
+
+    #[test]
     fn search_line_and_flat_results() {
         let mut app = app();
         app.handle_key(ch('/'));
@@ -1270,8 +1315,10 @@ mod tests {
         assert!(!app.preview_visible);
         render(&mut app, 80, 30);
         assert!(app.preview_visible);
+        render(&mut app, 130, 13);
+        assert!(app.preview_visible, "side by side needs only room for a few transcript rows");
         render(&mut app, 130, 12);
-        assert!(app.preview_visible, "side by side fits at any height");
+        assert!(!app.preview_visible, "but not less");
     }
 
     #[test]

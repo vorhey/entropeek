@@ -263,7 +263,7 @@ fn configured_font(term: &Emulator, facts: &Facts) -> Option<(String, PathBuf)> 
                 config.join("alacritty/alacritty.yml"),
                 facts.home.join(".alacritty.toml"),
             ],
-            &|text| setting(text, "family", '=').or_else(|| setting(text, "family", ':')),
+            &|text| alacritty_family(text),
         ),
         Emulator::Foot => first(vec![config.join("foot/foot.ini")], &|text| {
             setting(text, "font", '=').map(|v| v.split([':', ',']).next().unwrap_or("").trim().to_string())
@@ -313,12 +313,134 @@ fn setting(text: &str, key: &str, sep: char) -> Option<String> {
     })
 }
 
-/// `"key": "value"` in a JSON-with-comments settings file.
+/// `"key": "value"` in a JSON-with-comments settings file. Commented-out
+/// settings are ignored, and the last setting wins (as in VS Code).
 fn json_string(text: &str, key: &str) -> Option<String> {
+    let text = strip_json_comments(text);
     let needle = format!("\"{key}\"");
-    let rest = &text[text.find(&needle)? + needle.len()..];
-    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
-    Some(rest[..rest.find('"')?].to_string()).filter(|v| !v.trim().is_empty())
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&needle) {
+        let after = from + at + needle.len();
+        from = after;
+        let Some(rest) = text[after..].trim_start().strip_prefix(':') else { continue };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else { continue };
+        if let Some(end) = rest.find('"') {
+            found = Some(rest[..end].to_string()).filter(|v| !v.trim().is_empty());
+        }
+    }
+    found
+}
+
+/// `text` without `//` and `/* */` comments (outside strings).
+fn strip_json_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            match c {
+                '\\' => out.extend(chars.next()),
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('"', _) => {
+                in_string = true;
+                out.push(c);
+            }
+            ('/', Some('/')) => {
+                for c in chars.by_ref() {
+                    if c == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            ('/', Some('*')) => {
+                chars.next();
+                let mut last = ' ';
+                for c in chars.by_ref() {
+                    if last == '*' && c == '/' {
+                        break;
+                    }
+                    last = c;
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Alacritty's normal (not bold or italic) font family, from
+/// `alacritty.toml` (`[font.normal] family = …`, `[font] normal = { family
+/// = … }`, `font.normal.family = …`) or the older `alacritty.yml`.
+fn alacritty_family(text: &str) -> Option<String> {
+    let unquote = |v: &str| {
+        let v = v.trim();
+        let v = v.split_once(" #").map_or(v, |(v, _)| v).trim();
+        let v = v.trim_matches(['"', '\'']).trim();
+        (!v.is_empty()).then(|| v.to_string())
+    };
+    // TOML
+    let mut section = String::new();
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            section = header.trim_end_matches(']').replace([' ', '"'], "");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim().replace([' ', '"'], "");
+        let full = if section.is_empty() { key } else { format!("{section}.{key}") };
+        match full.as_str() {
+            "font.normal.family" => found = unquote(value).or(found),
+            "font.normal" => {
+                if let Some((_, rest)) = value.split_once("family") {
+                    let rest = rest.trim_start().strip_prefix('=').unwrap_or("");
+                    let rest = rest.trim_start();
+                    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'');
+                    if let Some(quote) = quote
+                        && let Some(end) = rest[1..].find(quote)
+                    {
+                        found = unquote(&rest[1..1 + end]).or(found);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if found.is_some() {
+        return found;
+    }
+    // YAML: the `family` key under `font:` / `normal:`.
+    let mut path: Vec<(usize, &str)> = Vec::new();
+    for line in text.lines() {
+        let content = line.trim_start();
+        if content.starts_with('#') || content.is_empty() {
+            continue;
+        }
+        let indent = line.len() - content.len();
+        let Some((key, value)) = content.split_once(':') else { continue };
+        while path.last().is_some_and(|(at, _)| *at >= indent) {
+            path.pop();
+        }
+        let key = key.trim().trim_matches(['"', '\'']);
+        if key == "family" && path.iter().map(|(_, k)| *k).eq(["font", "normal"]) {
+            found = unquote(value).or(found);
+        }
+        path.push((indent, key));
+    }
+    found
 }
 
 /// Nerd Font family and PostScript names: `JetBrainsMono Nerd Font`,
@@ -338,16 +460,54 @@ pub fn looks_like_nerd_font(font: &str) -> bool {
     })
 }
 
+/// The most of a configuration file read: real ones are far smaller.
+const CONFIG_LIMIT: u64 = 1024 * 1024;
+
+/// Reads a terminal configuration file, or its first megabyte.
+pub fn read_config(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(CONFIG_LIMIT).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// How long tmux gets to answer before it is stopped.
+const TMUX_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Inside tmux: the outer terminal, as `kitty(0.45.0)` (tmux 3.3+) or a
-/// terminal type like `xterm-kitty`.
+/// terminal type like `xterm-kitty`. Gives up (and stops tmux) after
+/// [`TMUX_TIMEOUT`].
 pub fn tmux_client() -> Option<String> {
-    let out = std::process::Command::new("tmux")
+    tmux_client_with("tmux", TMUX_TIMEOUT)
+}
+
+fn tmux_client_with(program: &str, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
         .args(["display-message", "-p", "#{client_termtype}\t#{client_termname}"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut stdout = Vec::new();
+    child.stdout.take()?.take(4096).read_to_end(&mut stdout).ok()?;
+    let text = String::from_utf8(stdout).ok()?;
     let mut parts = text.trim().split('\t');
     let termtype = parts.next().unwrap_or("").trim();
     let termname = parts.next().unwrap_or("").trim();
@@ -476,6 +636,57 @@ mod tests {
 
         let missing = World::new(&[("TERM", "foot")]);
         assert!(!missing.detect().icons && missing.detect().reason.contains("font setting"));
+    }
+
+    #[test]
+    fn only_the_active_normal_font_counts() {
+        let toml = |text: &'static str| {
+            World::new(&[("ALACRITTY_WINDOW_ID", "1")]).file("/h/.config/alacritty/alacritty.toml", text).detect()
+        };
+        let italic = toml("[font.normal]\nfamily = \"Arial\"\n[font.italic]\nfamily = \"JetBrainsMono Nerd Font\"\n");
+        assert!(!italic.icons && italic.reason.contains("Arial"), "{}", italic.reason);
+        assert!(toml("[font]\nnormal = { family = \"Hack Nerd Font\", style = \"Regular\" }\n").icons);
+        assert!(toml("font.normal.family = \"MesloLGS NF\"\n").icons);
+        assert!(!toml("[font.normal]\n# family = \"Hack Nerd Font\"\nfamily = \"Menlo\"\n").icons);
+        let yaml = World::new(&[("ALACRITTY_WINDOW_ID", "1")])
+            .file(
+                "/h/.config/alacritty/alacritty.yml",
+                "font:\n  normal:\n    family: Menlo\n  bold:\n    family: Hack Nerd Font\n",
+            )
+            .detect();
+        assert!(!yaml.icons && yaml.reason.contains("Menlo"), "{}", yaml.reason);
+
+        let vscode = |text: &'static str| {
+            World::new(&[("TERM_PROGRAM", "vscode"), ("XDG_CONFIG_HOME", "/cfg")])
+                .file("/cfg/Code/User/settings.json", text)
+                .detect()
+        };
+        let commented = vscode(
+            "{\n  // \"terminal.integrated.fontFamily\": \"Hack Nerd Font\",\n  \"terminal.integrated.fontFamily\": \"Menlo\"\n}",
+        );
+        assert!(!commented.icons && commented.reason.contains("Menlo"), "{}", commented.reason);
+        let block =
+            vscode("{ /* \"terminal.integrated.fontFamily\": \"Hack NF\" */ \"editor.fontFamily\": \"Menlo\" }");
+        assert!(!block.icons, "{}", block.reason);
+        let url = vscode("{ \"x\": \"http://a\", \"terminal.integrated.fontFamily\": \"Hack Nerd Font\" }");
+        assert!(url.icons, "`//` inside a string is not a comment: {}", url.reason);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_tmux_is_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let slow = dir.path().join("tmux");
+        std::fs::write(&slow, "#!/bin/sh\nsleep 5\necho kitty\n").unwrap();
+        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(tmux_client_with(slow.to_str().unwrap(), std::time::Duration::from_millis(100)), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        let quick = dir.path().join("quick");
+        std::fs::write(&quick, "#!/bin/sh\nprintf 'xterm-kitty\\tx'\n").unwrap();
+        std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(tmux_client_with(quick.to_str().unwrap(), TMUX_TIMEOUT).as_deref(), Some("xterm-kitty"));
     }
 
     #[test]

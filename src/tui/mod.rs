@@ -65,32 +65,24 @@ pub fn run(rt: &Runtime) -> Result<Outcome> {
         let file = Cache::default_file(&rt.env.cache_dir);
         Box::new(move || Cache::load(&file))
     };
+    let icons_tx = tx.clone();
     let mut jobs = Jobs::new(tx, providers, loader, Trash::new(rt.env.trash_dir()))?;
     jobs.scan();
 
     let guard = TerminalGuard::new(CrosstermOps)?;
     install_panic_hook();
     // One round trip to the terminal (background color, name and version,
-    // kitty's font), before anything else reads input.
+    // kitty's font), before anything else reads input. Keys typed
+    // meanwhile are handed to the event loop.
     let auto = rt.theme == theme::ThemeChoice::Auto || rt.icons == icons::IconChoice::Auto;
-    let reply = if auto { terminal::query(TERMINAL_QUERY_TIMEOUT) } else { terminal::Reply::default() };
+    let (reply, typed) = if auto { terminal::query(TERMINAL_QUERY_TIMEOUT) } else { Default::default() };
     let colorfgbg = std::env::var("COLORFGBG").ok();
     let mode = theme::resolve(rt.theme, || reply.background, colorfgbg.as_deref());
-    let detection = rt.icons.resolve(|| {
-        let env = |key: &str| std::env::var(key).ok();
-        let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
-        icons::detect(&icons::Facts {
-            env: &env,
-            reply: &reply,
-            tmux_client: &icons::tmux_client,
-            read: &read,
-            home: &rt.env.home,
-        })
-    });
-    app.theme = theme::Theme::for_mode(mode).with_icons(detection.icons);
-    app.icons_reason = detection.reason;
+    app.theme = theme::Theme::for_mode(mode);
+    start_icon_detection(rt, reply, &mut app, icons_tx);
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let result = event_loop(&mut terminal, &mut app, &jobs, &rx, &mut Crossterm);
+    let mut events = Queued { pending: typed.into_iter().map(Event::Key).collect(), inner: Crossterm };
+    let result = event_loop(&mut terminal, &mut app, &jobs, &rx, &mut events);
     if jobs.mutating() {
         app.info("finishing pending changes…");
         let _ = terminal.draw(|frame| view::draw(frame, &mut app));
@@ -102,10 +94,83 @@ pub fn run(rt: &Runtime) -> Result<Outcome> {
     result
 }
 
+/// How long the first frame waits for icon detection. Detection reads
+/// terminal configuration files and may ask tmux; when that is slow, the
+/// list appears without icons and they follow once detection answers.
+const ICON_WAIT: Duration = Duration::from_millis(30);
+
+/// Decides about icons on a worker thread, waiting briefly for the answer.
+fn start_icon_detection(rt: &Runtime, reply: terminal::Reply, app: &mut App, tx: mpsc::Sender<Msg>) {
+    if rt.icons != icons::IconChoice::Auto {
+        let detection = rt.icons.resolve(|| unreachable!("not auto"));
+        app.theme = app.theme.with_icons(detection.icons);
+        app.icons_reason = detection.reason;
+        return;
+    }
+    let home = rt.env.home.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let spawned = thread::Builder::new().name(format!("{}icons", jobs::WORKER_PREFIX)).spawn(move || {
+        let env = |key: &str| std::env::var(key).ok();
+        let read = |path: &std::path::Path| icons::read_config(path);
+        let detection = icons::detect(&icons::Facts {
+            env: &env,
+            reply: &reply,
+            tmux_client: &icons::tmux_client,
+            read: &read,
+            home: &home,
+        });
+        // The first frame may still be waiting; if not, the event loop
+        // applies it (it ignores the message when the first frame did).
+        let _ = done_tx.send(detection.clone());
+        let _ = tx.send(Msg::Icons(detection));
+    });
+    if spawned.is_err() {
+        app.icons_reason = "icon detection could not start".into();
+        return;
+    }
+    match done_rx.recv_timeout(ICON_WAIT) {
+        Ok(detection) => {
+            app.theme = app.theme.with_icons(detection.icons);
+            app.icons_reason = detection.reason;
+        }
+        Err(_) => {
+            app.theme = app.theme.with_icons(false);
+            app.icons_pending = true;
+        }
+    }
+}
+
+/// Events queued before the loop started (keys typed while the terminal
+/// was being queried), then the real source.
+struct Queued<E: EventSource> {
+    pending: std::collections::VecDeque<Event>,
+    inner: E,
+}
+
+impl<E: EventSource> EventSource for Queued<E> {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        if !self.pending.is_empty() {
+            return Ok(true);
+        }
+        self.inner.poll(timeout)
+    }
+
+    fn read(&mut self) -> io::Result<Event> {
+        match self.pending.pop_front() {
+            Some(event) => Ok(event),
+            None => self.inner.read(),
+        }
+    }
+}
+
 /// The steps of taking over the terminal and giving it back.
 pub trait TerminalOps {
     fn enable_raw(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
+    /// Pasted text arrives as one paste event instead of as keystrokes, so
+    /// a paste can never run commands.
+    fn enable_bracketed_paste(&mut self) -> io::Result<()>;
+    fn disable_bracketed_paste(&mut self) -> io::Result<()>;
     fn leave_alternate_screen(&mut self) -> io::Result<()>;
     fn disable_raw(&mut self) -> io::Result<()>;
 }
@@ -116,21 +181,27 @@ pub struct TerminalGuard<O: TerminalOps> {
     ops: O,
     raw: bool,
     alternate: bool,
+    paste: bool,
 }
 
 impl<O: TerminalOps> TerminalGuard<O> {
     pub fn new(ops: O) -> io::Result<TerminalGuard<O>> {
-        let mut guard = TerminalGuard { ops, raw: false, alternate: false };
+        let mut guard = TerminalGuard { ops, raw: false, alternate: false, paste: false };
         guard.ops.enable_raw()?;
         guard.raw = true;
         guard.ops.enter_alternate_screen()?;
         guard.alternate = true;
+        guard.ops.enable_bracketed_paste()?;
+        guard.paste = true;
         Ok(guard)
     }
 }
 
 impl<O: TerminalOps> Drop for TerminalGuard<O> {
     fn drop(&mut self) {
+        if self.paste {
+            let _ = self.ops.disable_bracketed_paste();
+        }
         if self.alternate {
             let _ = self.ops.leave_alternate_screen();
         }
@@ -151,6 +222,14 @@ impl TerminalOps for CrosstermOps {
         execute!(io::stdout(), tty::EnterAlternateScreen)
     }
 
+    fn enable_bracketed_paste(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), event::EnableBracketedPaste)
+    }
+
+    fn disable_bracketed_paste(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), event::DisableBracketedPaste)
+    }
+
     fn leave_alternate_screen(&mut self) -> io::Result<()> {
         execute!(io::stdout(), tty::LeaveAlternateScreen, cursor::Show)
     }
@@ -161,19 +240,27 @@ impl TerminalOps for CrosstermOps {
 }
 
 /// A panic on the UI thread restores the terminal before the message is
-/// printed. A panic on a worker is caught there and shown in the status
-/// line, so it must not tear down the screen or print over it.
+/// printed. A panic on any other thread (a worker, or a thread of the pool
+/// workers use) is caught by the worker and shown in the status line, so
+/// it must neither tear down the screen nor print over it.
 fn install_panic_hook() {
+    let ui = thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if thread::current().name().is_some_and(|name| name.starts_with(jobs::WORKER_PREFIX)) {
+        if !restores_terminal(ui) {
             return;
         }
         let mut ops = CrosstermOps;
+        let _ = ops.disable_bracketed_paste();
         let _ = ops.leave_alternate_screen();
         let _ = ops.disable_raw();
         previous(info);
     }));
+}
+
+/// Whether a panic on the current thread should give the terminal back.
+fn restores_terminal(ui: thread::ThreadId) -> bool {
+    thread::current().id() == ui
 }
 
 /// Where terminal events come from. Real runs use crossterm; tests script it.
@@ -215,7 +302,7 @@ where
         // result before it stops counting as busy, so either we see it busy
         // (and poll again soon) or its result is already in the channel.
         // Checking after draining could miss a result and sleep on it.
-        let mut busy = jobs.busy();
+        let mut busy = jobs.busy() || app.icons_pending;
         while let Ok(msg) = rx.try_recv() {
             dirty = true;
             if let Some(effect) = app.on_msg(msg)
@@ -400,6 +487,12 @@ mod tests {
         fn enter_alternate_screen(&mut self) -> io::Result<()> {
             self.step("alt on")
         }
+        fn enable_bracketed_paste(&mut self) -> io::Result<()> {
+            self.step("paste on")
+        }
+        fn disable_bracketed_paste(&mut self) -> io::Result<()> {
+            self.step("paste off")
+        }
         fn leave_alternate_screen(&mut self) -> io::Result<()> {
             self.step("alt off")
         }
@@ -422,7 +515,17 @@ mod tests {
         };
         assert_eq!(run(Some("raw on"), false), vec!["raw on"]);
         assert_eq!(run(Some("alt on"), false), vec!["raw on", "alt on", "raw off"]);
-        assert_eq!(run(None, true), vec!["raw on", "alt on", "alt off", "raw off"]);
+        assert_eq!(run(Some("paste on"), false), vec!["raw on", "alt on", "paste on", "alt off", "raw off"]);
+        assert_eq!(run(None, true), vec!["raw on", "alt on", "paste on", "paste off", "alt off", "raw off"]);
+    }
+
+    #[test]
+    fn only_the_ui_thread_gives_the_terminal_back() {
+        let ui = thread::current().id();
+        assert!(restores_terminal(ui));
+        // Pool threads have no name, so a name check would not tell them apart.
+        let pool = thread::spawn(move || restores_terminal(ui)).join().unwrap();
+        assert!(!pool, "a worker pool thread's caught panic leaves the terminal alone");
     }
 
     /// Plays scripted events like a user who waits for the UI to settle: the
@@ -551,6 +654,33 @@ mod tests {
         let outcome = event_loop(&mut terminal, &mut app, &jobs, &rx, &mut script).unwrap();
         assert!(matches!(outcome, Outcome::Done));
         assert!(script.outer_polls >= 20_000 / INPUT_BATCH, "only {} frames for 20k keys", script.outer_polls);
+    }
+
+    #[test]
+    fn keys_typed_during_startup_are_handled_first() {
+        let (_dir, _env, mut app, jobs, rx) = loop_fixture();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // `q` typed while the terminal was being queried; the real source
+        // would deliver nothing more.
+        let mut events = Queued { pending: VecDeque::from([Event::Key(key('q'))]), inner: Script::new("") };
+        let outcome = event_loop(&mut terminal, &mut app, &jobs, &rx, &mut events).unwrap();
+        assert!(matches!(outcome, Outcome::Done));
+        assert_eq!(events.inner.outer_polls, 0, "quit before ever waiting for the terminal");
+    }
+
+    #[test]
+    fn late_icon_detection_applies_unless_the_user_chose() {
+        let (_dir, _env, mut app, _jobs, _rx) = loop_fixture();
+        let found = icons::Detection { icons: true, reason: "kitty".into() };
+        app.icons_pending = true;
+        app.on_msg(Msg::Icons(found.clone()));
+        assert!(app.theme.icons && !app.icons_pending);
+        app.theme = app.theme.with_icons(false);
+        app.icons_pending = true;
+        app.handle_key(key('i'));
+        let chosen = app.theme.icons;
+        app.on_msg(Msg::Icons(icons::Detection { icons: !chosen, reason: "late".into() }));
+        assert_eq!(app.theme.icons, chosen, "pressing `i` wins over a late answer");
     }
 
     #[test]

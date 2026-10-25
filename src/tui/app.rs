@@ -144,6 +144,8 @@ pub enum Msg {
         result: Result<TrashEntry, String>,
     },
     ResumeChecked(Result<ResumeCommand, String>),
+    /// Whether to show icons, decided off the input thread at startup.
+    Icons(super::icons::Detection),
 }
 
 /// Raw transcripts kept for instant back-and-forth (bytes of text).
@@ -263,6 +265,23 @@ impl SearchEdit {
 
 pub type ResumeLine = Box<dyn Fn(&Session) -> String>;
 
+/// Whether `key` (with its modifiers) does something that must happen once
+/// per press: opening, toggling, deleting, confirming, quitting. Such keys
+/// ignore auto-repeat; moving around does not.
+fn acts_once(key: &KeyEvent, ctrl: bool) -> bool {
+    if ctrl {
+        // Ctrl-D / Ctrl-U / Ctrl-N / Ctrl-P move; the rest are commands.
+        return !matches!(key.code, KeyCode::Char('d' | 'u' | 'n' | 'p' | 'f' | 'b'));
+    }
+    matches!(
+        key.code,
+        KeyCode::Char('d' | 'y' | 'u' | 'r' | 't' | 'i' | 'q' | 'w' | 'p' | 'z' | 'v' | '?' | ' ')
+            | KeyCode::Enter
+            | KeyCode::Delete
+            | KeyCode::Tab
+    )
+}
+
 pub struct App {
     pub sessions: Vec<Session>,
     haystacks: Vec<String>,
@@ -318,6 +337,8 @@ pub struct App {
     pub theme: Theme,
     /// Why icons started on or off (shown when switching them).
     pub icons_reason: String,
+    /// Startup icon detection has not answered yet (and `i` was not pressed).
+    pub icons_pending: bool,
     resume_line: ResumeLine,
 }
 
@@ -364,6 +385,7 @@ impl App {
             home,
             theme: Theme::default(),
             icons_reason: String::new(),
+            icons_pending: false,
             resume_line,
         };
         app.set_sessions(sessions);
@@ -625,17 +647,9 @@ impl App {
             return None;
         }
         // Holding down a key that acts once must not act again, nor cancel
-        // a pending confirmation.
-        if key.kind == KeyEventKind::Repeat
-            && !self.searching
-            && matches!(
-                key.code,
-                KeyCode::Char('d' | 'y' | 'u' | 'r' | 't' | 'i' | 'q' | 'w' | 'p' | 'z' | 'v' | '?' | ' ')
-                    | KeyCode::Enter
-                    | KeyCode::Delete
-                    | KeyCode::Tab
-            )
-        {
+        // a pending confirmation. Navigation (including Ctrl-D/Ctrl-U page
+        // moves) repeats.
+        if key.kind == KeyEventKind::Repeat && !self.searching && acts_once(&key, ctrl) {
             return None;
         }
         self.status = None;
@@ -689,8 +703,11 @@ impl App {
             KeyCode::Char('p') if ctrl => self.move_cursor(-1),
             KeyCode::Char('u') if ctrl => self.set_query(String::new()),
             KeyCode::Char('w') if ctrl => {
+                // Words are split the way the query is: on any whitespace.
                 let trimmed = self.query.trim_end();
-                let cut = trimmed.rfind(' ').map_or(0, |i| i + 1);
+                let cut = trimmed
+                    .rfind(char::is_whitespace)
+                    .map_or(0, |i| i + trimmed[i..].chars().next().map_or(1, char::len_utf8));
                 self.set_query(trimmed[..cut].to_string());
             }
             _ => {}
@@ -700,7 +717,10 @@ impl App {
 
     /// Applies several search edits with one filter pass, so a paste or a
     /// burst of typing costs one rebuild instead of one per character.
+    /// Backspace removes one visible character (a whole grapheme, such as
+    /// an emoji sequence or a letter with its accents).
     pub fn edit_search(&mut self, edits: &[SearchEdit]) {
+        use unicode_segmentation::UnicodeSegmentation;
         self.status = None;
         let mut query = self.query.clone();
         for edit in edits {
@@ -708,7 +728,8 @@ impl App {
                 SearchEdit::Insert(c) if !c.is_control() => query.push(*c),
                 SearchEdit::Insert(_) => {}
                 SearchEdit::Backspace => {
-                    query.pop();
+                    let keep = query.grapheme_indices(true).next_back().map_or(0, |(at, _)| at);
+                    query.truncate(keep);
                 }
             }
         }
@@ -841,6 +862,8 @@ impl App {
             }
             KeyCode::Char('r') => return Some(self.rescan()),
             KeyCode::Char('i') => {
+                // The user's choice wins over a detection still running.
+                self.icons_pending = false;
                 self.theme = self.theme.with_icons(!self.theme.icons);
                 self.wrapped = None;
                 let state = if self.theme.icons { "icons on (needs a Nerd Font)" } else { "icons off" };
@@ -1010,6 +1033,16 @@ impl App {
             }
             Msg::ResumeChecked(Ok(command)) => return Some(Effect::Exec(command)),
             Msg::ResumeChecked(Err(error)) => self.error(error),
+            Msg::Icons(detection) => {
+                if self.icons_pending {
+                    self.icons_pending = false;
+                    if detection.icons != self.theme.icons {
+                        self.theme = self.theme.with_icons(detection.icons);
+                        self.wrapped = None;
+                    }
+                    self.icons_reason = detection.reason;
+                }
+            }
         }
         None
     }
@@ -1222,6 +1255,43 @@ mod tests {
         assert_eq!(selected_id(&app), Some("a2"));
         app.handle_key(KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release));
         assert_eq!(selected_id(&app), Some("a2"), "releases are ignored");
+    }
+
+    #[test]
+    fn held_ctrl_page_moves_repeat_but_commands_do_not() {
+        let many: Vec<Session> =
+            (0..100).map(|i| session(AgentKind::Claude, &format!("s{i:03}"), "/w", 1_000 - i, "t")).collect();
+        let mut app = App::new(many, "/h".into(), 2_000, Box::new(|_| String::new()));
+        app.grouped = false;
+        app.rebuild(None);
+        app.list_height = 10;
+        let held = |c| KeyEvent::new_with_kind(KeyCode::Char(c), KeyModifiers::CONTROL, KeyEventKind::Repeat);
+        let start = app.cursor;
+        app.handle_key(held('d'));
+        assert!(app.cursor > start, "a held Ctrl-D keeps paging down");
+        let down = app.cursor;
+        app.handle_key(held('u'));
+        assert!(app.cursor < down, "a held Ctrl-U keeps paging up");
+        // A held `d` still arms a delete only once.
+        app.handle_key(KeyEvent::new_with_kind(KeyCode::Char('d'), KeyModifiers::NONE, KeyEventKind::Repeat));
+        assert!(app.delete_armed.is_none());
+    }
+
+    #[test]
+    fn backspace_removes_one_visible_character() {
+        let mut app = app();
+        app.handle_key(ch('/'));
+        for query in ["ab\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", "ae\u{301}", "a\u{1f1fa}\u{1f1f8}"] {
+            app.set_query(String::new());
+            let edits: Vec<SearchEdit> = query.chars().map(SearchEdit::Insert).collect();
+            app.edit_search(&edits);
+            app.edit_search(&[SearchEdit::Backspace]);
+            assert_eq!(app.query.chars().next(), Some('a'));
+            assert!(app.query.len() <= 2, "{query:?} left {:?}", app.query);
+        }
+        app.set_query("one\ttwo".into());
+        app.handle_key(ctrl('w'));
+        assert_eq!(app.query, "one\t", "Ctrl-W splits on any whitespace, like the query");
     }
 
     #[test]
