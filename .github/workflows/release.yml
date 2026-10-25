@@ -15,7 +15,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Tag matches Cargo.toml
         env:
           TAG: ${{ github.ref_name }}
@@ -24,16 +24,14 @@ jobs:
           printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           test "v${version}" = "$TAG" || { echo "Cargo.toml says ${version}, tag is ${TAG}"; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+
+  # Every CI check: formatting, clippy, tests on Linux and macOS, the load
+  # and latency tests, and the minimum supported Rust version.
+  checks:
+    uses: ./.github/workflows/ci.yml
 
   build:
-    needs: verify
+    needs: [verify, checks]
     strategy:
       matrix:
         include:
@@ -44,11 +42,11 @@ jobs:
           - { os: darwin, arch: amd64, target: x86_64-apple-darwin, runner: macos-latest }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
       - name: Install musl
@@ -73,7 +71,7 @@ jobs:
           mkdir -p stage dist
           cp "target/${{ matrix.target }}/release/entropeek" LICENSE README.md stage/
           tar -czf "dist/entropeek_${TAG}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" -C stage entropeek LICENSE README.md
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: entropeek-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
@@ -84,8 +82,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true

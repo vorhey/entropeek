@@ -1,0 +1,8 @@
+# Workflow actions are pinned to commits; this proposes updates (with the
+# version in a comment) as pull requests.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
