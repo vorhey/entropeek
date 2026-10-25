@@ -95,8 +95,10 @@ entropeek works it out at startup, cheapest evidence first:
 5. Anything else: no icons (a missing icon beats a broken glyph).
 
 The questions to the terminal go out together with the background color
-query, so this adds no startup time. Press `i` to switch icons; the status
-line also says what the detection decided and why.
+query, and reading configuration files (or asking tmux) happens on a
+worker: if that is slow, the list appears without icons and they follow.
+Press `i` to switch icons; the status line also says what the detection
+decided and why.
 
 A session can be named by its id, any unique id prefix of 4+ characters,
 `claude:<id>` / `codex:<id>` when two agents use the same id, or the path
@@ -138,19 +140,37 @@ instead of picking one. `delete` never accepts `latest`.
   For Claude it also takes the session's subagent folder, `session-env/<id>`,
   `file-history/<id>` and todos. The trash is built so files are not lost:
   - Each entry's `manifest.json` records where every file came from, and is
-    written *before* anything moves. A delete or restore that was interrupted
-    (crash, power loss, kill) shows up in `entropeek trash` as interrupted;
-    `trash restore` finishes it.
+    written and flushed to disk *before* anything moves. A delete or restore
+    that was interrupted (a crash or kill) shows up in `entropeek trash` as
+    interrupted; `trash restore` finishes it. Directory changes are flushed
+    as they happen, but whether they all survive a sudden power loss also
+    depends on the filesystem.
   - Moves never overwrite: if a file reappears where a session is being
-    restored, the restore stops and everything stays in the trash.
+    restored, the restore stops and everything stays in the trash. On a
+    filesystem that cannot rename without replacing, the destination is
+    claimed first (a hard link or an empty directory), or the move is refused.
+  - Each delete, restore and purge locks its entry, so a second entropeek
+    (say `trash purge --all` in another terminal) skips or refuses an entry
+    that is still being filled or emptied.
+  - Sessions that another session needs are not deleted: deleting a Codex
+    session that a fork refers to (instead of copying its history) is
+    refused until the fork is gone, and a delete whose related files cannot
+    all be checked stops instead of leaving some behind.
   - If a delete fails halfway and something cannot be put back, it stays in
     the trash as a restorable entry instead of being thrown away.
   - Only paths that really resolve inside the agent's directory are touched.
     A linked agent directory (`~/.claude -> /data/claude`) is fine; a project
-    folder that links outside it is listed but cannot be deleted.
-  - Across filesystems, files are copied (keeping links, permissions and
-    modification times) before the originals are removed; special files are
-    refused, and a file that changes during the copy is left alone.
+    folder that links outside it is listed but cannot be deleted. Moves are
+    made relative to directories opened without following links, so one
+    swapped for a link after the check is refused too.
+  - Across filesystems, items are copied to a hidden, private staging name
+    (keeping links, permissions and modification times), checked to be
+    unchanged, flushed, and only then given their real name and removed from
+    where they were. Special files are refused, and if anything in the item
+    changed during the copy, the original is left alone. An interrupted copy
+    never blocks a later `trash restore`. (A program still appending through
+    a file it already has open can lose what it writes after the final
+    check; quit the agent before deleting its live session.)
   - Quitting or resuming waits for a running delete or restore to finish.
   - The files of an entry are plain files in `<entry>/items/<n>`, so they can
     always be recovered by hand using the manifest.
@@ -163,7 +183,9 @@ instead of picking one. `delete` never accepts `latest`.
   files. Trashed files keep their own permissions inside the private trash.
 - Relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `ENTROPEEK_*` values are resolved
   once against the directory entropeek starts in. Resume runs the agent
-  program found on `PATH` at that moment, by its absolute path.
+  program found on `PATH` at that moment, by its absolute path; printed and
+  copied commands use that path too when `PATH` found it through a relative
+  entry. Session ids that look like options (`--last`) are refused.
 - Text from session files (titles, paths, ids) is cleaned of terminal control
   characters before it is printed.
 
@@ -171,8 +193,10 @@ instead of picking one. `delete` never accepts `latest`.
 
 - **Nothing slow runs on the input thread.** Loading the cache, scanning,
   reading and wrapping transcripts, checking a resume command, deletes and
-  restores all run on a fixed set of worker threads. Repeated rescans
-  collapse into one; only the newest preview request runs.
+  restores all run on a fixed set of worker threads, and large wrapped
+  transcripts are freed on a background thread. Repeated rescans collapse
+  into one; only the newest preview request runs. Keys typed while the
+  terminal answers its startup questions are kept.
 - **Cache + background refresh.** The list appears from the cache immediately; a
   background scan re-parses only files whose mtime or size changed.
 - **Cheap parsing.** Lines are split with SIMD `memchr` and skipped by a byte
@@ -180,9 +204,13 @@ instead of picking one. `delete` never accepts `latest`.
   parsed for the list. Files are parsed in parallel with `rayon`.
 - **Only visible rows are drawn**, search runs over pre-lowercased text,
   counts are kept up to date instead of recomputed per frame, and wrapped
-  transcripts are cached (within a memory budget).
-- **Input is handled in bounded batches**: a long paste is filtered once, and
-  the screen updates at least every frame even under a flood of keys.
+  transcripts are cached (within a memory budget). A preview holds at most
+  100,000 lines (the newest; `entropeek show` prints everything), so its
+  size is bounded however the text is shaped.
+- **Input is handled in bounded batches**: a long paste arrives as one paste
+  (bracketed paste) and is filtered once; outside the search box it does
+  nothing. The screen updates at least every frame even under a flood of
+  keys.
 
 `cargo test --release -- --ignored --nocapture` measures worst cases, not
 just averages. On a desktop Linux machine (2026), with fixtures freshly
@@ -193,6 +221,7 @@ written (so the OS file cache is warm):
 | Frame with 10,000 sessions | 0.34 ms | 0.5 ms |
 | Search keystroke over 10,000 sessions + frame | 0.7 ms | 1.2 ms |
 | Frame while a 4 MB transcript is being wrapped | 0.4 ms | 1.3 ms |
+| Taking a finished 100,000-line wrap (replacing the last) | < 0.01 ms | 0.05 ms |
 | Longest event-loop pause while a 21 MB session loads | | 2 ms |
 | Scan 2,000 files (280 MB), no metadata cache | 28 ms | |
 | Same, with the metadata cache | 3 ms | 3.5 ms |
