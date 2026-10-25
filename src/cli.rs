@@ -259,7 +259,7 @@ fn trash(ctx: &Runtime, action: TrashAction, out: &mut dyn Write) -> Result<()> 
     let trash = ctx.trash();
     match action {
         TrashAction::List { json } => {
-            let listing = trash.scan();
+            let listing = trash.scan()?;
             for invalid in &listing.invalid {
                 eprintln!(
                     "entropeek: warning: {} is not a usable trash entry: {}",
@@ -288,8 +288,11 @@ fn trash(ctx: &Runtime, action: TrashAction, out: &mut dyn Write) -> Result<()> 
                 (None, true) => i64::MAX,
                 _ => bail!("pass exactly one of --older-than-days N or --all"),
             };
-            let count = trash.purge_older_than(cutoff)?;
-            writeln!(out, "permanently deleted {count} session(s)")?;
+            let purged = trash.purge_older_than(cutoff)?;
+            writeln!(out, "permanently deleted {} session(s)", purged.count)?;
+            if purged.busy > 0 {
+                writeln!(out, "skipped {} being changed by another entropeek process", purged.busy)?;
+            }
         }
     }
     Ok(())
@@ -379,10 +382,20 @@ fn write_table_with(
     Ok(())
 }
 
+/// Entries are most recent first. `trash restore <session id>` picks the
+/// most recent deletion of a session, so older deletions of the same
+/// session show the key that selects them.
 fn write_trash_table(out: &mut dyn Write, entries: &[TrashEntry], now: i64) -> io::Result<()> {
     writeln!(out, "{}  {}  {}  TITLE", text::fit("DELETED", 7), text::fit("AGENT", 6), text::fit("SESSION", 36))?;
+    let mut seen = std::collections::HashSet::new();
     for e in entries {
-        let note = if e.is_incomplete() { "  (interrupted; restore to finish)" } else { "" };
+        let mut note = String::new();
+        if e.is_incomplete() {
+            note.push_str("  (interrupted; restore to finish)");
+        }
+        if !seen.insert(e.session.id.as_str()) {
+            note.push_str(&format!("  (older deletion; restore with key {})", text::one_line(&e.key)));
+        }
         writeln!(
             out,
             "{}  {}  {}  {}{note}",
@@ -454,6 +467,26 @@ mod tests {
         let mut out = Vec::new();
         write_table(&mut out, &[s], "/home/u", 0).unwrap();
         assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2, "no forged rows");
+    }
+
+    #[test]
+    fn trash_table_gives_older_deletions_a_selector() {
+        let entry = |key: &str, at: i64| TrashEntry {
+            version: crate::trash::MANIFEST_VERSION,
+            key: key.into(),
+            deleted_at: at,
+            state: crate::trash::EntryState::Trashed,
+            root: None,
+            session: sample_session(AgentKind::Claude, "same-id"),
+            items: vec![],
+        };
+        let mut out = Vec::new();
+        write_trash_table(&mut out, &[entry("200-claude-same-id", 200), entry("100-claude-same-id", 100)], 300)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[1].contains("restore with key"), "the latest is selected by its id");
+        assert!(lines[2].ends_with("(older deletion; restore with key 100-claude-same-id)"), "{}", lines[2]);
     }
 
     #[test]
