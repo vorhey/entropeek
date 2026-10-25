@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::content::{Block, extract};
-use super::{FileStamp, Provider, ResumeCommand, files_in_subdirs, has_extension, push_turn};
+use super::{FileStamp, Provider, ResumeCommand, Unread, files_in_subdirs, has_extension, push_turn};
 use crate::jsonl::{self, Marker};
 use crate::model::{AgentKind, Role, Session, Turn};
 use crate::text;
@@ -242,10 +242,10 @@ impl Provider for ClaudeProvider {
         &self.root
     }
 
-    fn discover(&self, errors: &mut Vec<String>) -> Vec<PathBuf> {
+    fn discover(&self, unread: &mut Unread) -> Vec<PathBuf> {
         // Only `projects/<dir>/<id>.jsonl`; subagent transcripts live deeper
         // (`<id>/subagents/*.jsonl`) and are not sessions of their own.
-        files_in_subdirs(&self.root.join("projects"), |p| has_extension(p, "jsonl"), errors)
+        files_in_subdirs(&self.root.join("projects"), |p| has_extension(p, "jsonl"), unread)
     }
 
     fn parse(&self, path: &Path, stamp: FileStamp) -> Result<Option<Session>> {
@@ -267,7 +267,9 @@ impl Provider for ClaudeProvider {
         }
     }
 
-    fn related_paths(&self, session: &Session) -> Vec<PathBuf> {
+    /// Fails if a companion location exists but cannot be checked, so a
+    /// delete never silently leaves part of a session behind.
+    fn related_paths(&self, session: &Session) -> Result<Vec<PathBuf>> {
         let id = &session.id;
         let mut paths = vec![session.path.clone()];
         // `<id>/` next to the transcript holds subagent logs and tool output.
@@ -276,18 +278,32 @@ impl Provider for ClaudeProvider {
             self.root.join("session-env").join(id),
             self.root.join("file-history").join(id),
         ];
-        paths.extend(candidates.into_iter().filter(|p| p.exists()));
-        if let Ok(entries) = fs::read_dir(self.root.join("todos")) {
+        for candidate in candidates {
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => paths.push(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("checking {}", candidate.display())),
+            }
+        }
+        let todos_dir = self.root.join("todos");
+        let entries = match fs::read_dir(&todos_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => None,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", todos_dir.display())),
+        };
+        if let Some(entries) = entries {
             let prefix = format!("{id}-");
-            let mut todos: Vec<PathBuf> = entries
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-                .map(|e| e.path())
-                .collect();
+            let mut todos = Vec::new();
+            for entry in entries {
+                let entry = entry.with_context(|| format!("reading {}", todos_dir.display()))?;
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    todos.push(entry.path());
+                }
+            }
             todos.sort();
             paths.extend(todos);
         }
-        paths
+        Ok(paths)
     }
 }
 
@@ -607,10 +623,10 @@ mod tests {
         fs::write(root.join("todos").join("other-agent.json"), b"[]").unwrap();
 
         let provider = ClaudeProvider::new(root.clone());
-        assert_eq!(provider.discover(&mut Vec::new()), vec![file.clone()]);
+        assert_eq!(provider.discover(&mut Default::default()), vec![file.clone()]);
 
         let session = provider.parse(&file, FileStamp::of(&file).unwrap()).unwrap().unwrap();
-        let related = provider.related_paths(&session);
+        let related = provider.related_paths(&session).unwrap();
         assert_eq!(
             related,
             vec![

@@ -8,10 +8,16 @@
 //! Thread names (titles) live in `~/.codex/session_index.jsonl`.
 //!
 //! Sub-agents a session spawns get rollout files of their own, marked in
-//! their `session_meta` (`thread_source: "subagent"`, `parent_thread_id`)
-//! and starting with a copy of the parent's history. They are part of the
-//! parent session, not sessions of their own: they are not listed, and
-//! deleting the parent takes them along.
+//! their `session_meta` (`thread_source: "subagent"`, `parent_thread_id`,
+//! or a `subagent`/`internal` `source`) and starting with a copy of the
+//! parent's history. They are part of the parent session, not sessions of
+//! their own: they are not listed, and deleting the parent takes them along.
+//!
+//! A fork can instead *refer* to its base's history (`history_base`: the
+//! base thread and how many of its bytes are inherited) rather than copy
+//! it. Its transcript is then the base's prefix followed by its own
+//! records, and the base cannot be deleted while such a fork remains:
+//! entropeek refuses, rather than leave the fork without its beginning.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -24,7 +30,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use super::content::{custom_tool_summary, extract, shell_action_summary, tool_summary};
-use super::{FileStamp, Provider, ResumeCommand, files_recursive, has_extension, push_turn};
+use super::{FileStamp, Provider, ResumeCommand, Unread, files_recursive, has_extension, push_turn};
 use crate::jsonl::{self, Marker};
 use crate::model::{AgentKind, Role, Session, Turn};
 use crate::text;
@@ -49,10 +55,17 @@ impl CodexProvider {
         }
     }
 
-    fn titles(&self) -> Arc<HashMap<String, String>> {
+    /// The thread names. A failed read is reported and not remembered: the
+    /// last titles read are used meanwhile, and the next scan tries again.
+    fn titles(&self, errors: &mut Vec<String>) -> Arc<HashMap<String, String>> {
         let index = self.root.join(INDEX_FILE);
-        let Some(stamp) = FileStamp::of(&index) else {
-            return Arc::default();
+        let stamp = match FileStamp::try_of(&index) {
+            Ok(stamp) => stamp,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Arc::default(),
+            Err(e) => {
+                errors.push(format!("cannot read {}: {e}", index.display()));
+                return self.last_titles();
+            }
         };
         let mut memo = self.titles.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((seen, titles)) = memo.as_ref()
@@ -62,9 +75,22 @@ impl CodexProvider {
         }
         #[cfg(test)]
         self.title_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let titles = Arc::new(read_titles(&self.root));
-        *memo = Some((stamp, titles.clone()));
-        titles
+        match read_titles(&self.root) {
+            Ok(titles) => {
+                let titles = Arc::new(titles);
+                *memo = Some((stamp, titles.clone()));
+                titles
+            }
+            Err(e) => {
+                errors.push(format!("cannot read {}: {e}", index.display()));
+                memo.as_ref().map(|(_, titles)| titles.clone()).unwrap_or_default()
+            }
+        }
+    }
+
+    fn last_titles(&self) -> Arc<HashMap<String, String>> {
+        let memo = self.titles.lock().unwrap_or_else(|e| e.into_inner());
+        memo.as_ref().map(|(_, titles)| titles.clone()).unwrap_or_default()
     }
 }
 
@@ -97,38 +123,51 @@ struct Meta<'a> {
     thread_source: Option<Cow<'a, str>>,
     #[serde(borrow, default)]
     parent_thread_id: Option<Cow<'a, str>>,
-    /// `{"subagent": {"thread_spawn": {"parent_thread_id": ...}}}` for
-    /// spawned threads; other shapes for normal sessions.
+    /// `"cli"`, `"vscode"`, … for sessions people start;
+    /// `{"subagent": {"thread_spawn": {"parent_thread_id": ...}}}`,
+    /// `{"subagent": "review"}` (and other kinds) or `internal` for threads
+    /// Codex starts itself.
     #[serde(borrow, default)]
     source: Option<&'a RawValue>,
+    /// For a fork that refers to its base's history instead of copying it.
+    #[serde(borrow, default)]
+    history_base: Option<HistoryBase<'a>>,
 }
 
 #[derive(Deserialize)]
-struct Source<'a> {
+struct HistoryBase<'a> {
     #[serde(borrow, default)]
-    subagent: Option<Subagent<'a>>,
+    thread_id: Option<Cow<'a, str>>,
+    /// How many bytes of the base rollout the fork inherits.
+    #[serde(default)]
+    end_byte_offset: Option<u64>,
 }
 
-#[derive(Deserialize)]
-struct Subagent<'a> {
-    #[serde(borrow, default)]
-    thread_spawn: Option<ThreadSpawn<'a>>,
-}
-
-#[derive(Deserialize)]
-struct ThreadSpawn<'a> {
-    #[serde(borrow, default)]
-    parent_thread_id: Option<Cow<'a, str>>,
+/// Whether a `source` says Codex started this thread itself (a sub-agent
+/// of any kind, or an internal thread), and if so its parent, when known.
+fn non_root_source(source: &serde_json::Value) -> Option<Option<String>> {
+    use serde_json::Value;
+    match source {
+        Value::String(kind) if kind == "subagent" || kind == "internal" => Some(None),
+        Value::Object(map) => {
+            if let Some(subagent) = map.get("subagent") {
+                let parent = subagent.pointer("/thread_spawn/parent_thread_id").and_then(Value::as_str);
+                return Some(parent.map(str::to_string));
+            }
+            map.contains_key("internal").then_some(None)
+        }
+        _ => None,
+    }
 }
 
 impl Meta<'_> {
-    /// For a spawned sub-agent thread: its parent's id (possibly unknown).
+    /// For a thread Codex started itself (a sub-agent): its parent's id,
+    /// possibly unknown.
     fn subagent_of(&self) -> Option<Option<String>> {
         let spawn = self
             .source
-            .and_then(|raw| serde_json::from_str::<Source>(raw.get()).ok())
-            .and_then(|s| s.subagent)
-            .map(|s| s.thread_spawn.and_then(|t| t.parent_thread_id).map(Cow::into_owned));
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+            .and_then(|source| non_root_source(&source));
         let marked = self.thread_source.as_deref() == Some("subagent");
         match (spawn, &self.parent_thread_id) {
             (Some(parent), own) => Some(parent.or_else(|| own.as_deref().map(str::to_string))),
@@ -139,24 +178,42 @@ impl Meta<'_> {
     }
 }
 
-/// The id and, for a sub-agent, the parent id of the thread a rollout file
-/// holds. Reads only up to the file's own (first) `session_meta`.
-fn read_thread(path: &Path) -> Option<(String, Option<Option<String>>)> {
+/// How one rollout file relates to others.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Thread {
+    id: String,
+    /// For a sub-agent: its parent's id, possibly unknown.
+    subagent_of: Option<Option<String>>,
+    /// For a fork that refers to its base's history: the base thread.
+    base: Option<String>,
+    /// How many of the base's bytes it inherits.
+    base_bytes: Option<u64>,
+}
+
+/// How a rollout file relates to others, from its own (first)
+/// `session_meta`. `Ok(None)` if it has none; an error if it cannot be read.
+fn read_thread(path: &Path) -> std::io::Result<Option<Thread>> {
     use std::io::BufRead;
-    let file = fs::File::open(path).ok()?;
+    let file = fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     for line in reader.split(b'\n').take(16) {
-        let line = line.ok()?;
+        let line = line?;
         let Ok(record) = serde_json::from_slice::<Record>(&line) else { continue };
         if record.kind.as_deref() != Some("session_meta") {
             continue;
         }
-        let meta = parse_payload::<Meta>(&record)?;
-        let id =
-            meta.id.as_deref().filter(|id| !id.is_empty()).map(str::to_string).or_else(|| id_from_file_name(path))?;
-        return Some((id, meta.subagent_of()));
+        let Some(meta) = parse_payload::<Meta>(&record) else { return Ok(None) };
+        let id = meta.id.as_deref().filter(|id| !id.is_empty()).map(str::to_string).or_else(|| id_from_file_name(path));
+        let Some(id) = id else { return Ok(None) };
+        let base = meta.history_base.as_ref();
+        return Ok(Some(Thread {
+            subagent_of: meta.subagent_of(),
+            base: base.and_then(|b| b.thread_id.as_deref()).filter(|b| !b.is_empty()).map(str::to_string),
+            base_bytes: base.and_then(|b| b.end_byte_offset),
+            id,
+        }));
     }
-    None
+    Ok(None)
 }
 
 #[derive(Deserialize)]
@@ -259,6 +316,7 @@ pub fn parse_meta(path: &Path, bytes: &[u8], stamp: FileStamp) -> Option<Session
     let mut first_prompt = None;
     let mut last_prompt = None;
     let mut user_turns = 0u32;
+    let mut has_base = false;
 
     for line in jsonl::lines(bytes) {
         let wanted = meta_marker.in_line(line)
@@ -276,6 +334,7 @@ pub fn parse_meta(path: &Path, bytes: &[u8], stamp: FileStamp) -> Option<Session
                     if meta.subagent_of().is_some() {
                         return None;
                     }
+                    has_base = meta.history_base.as_ref().is_some_and(|b| b.thread_id.is_some());
                     id = meta.id.map(Cow::into_owned);
                     if let Some(value) = meta.cwd.filter(|v| !v.is_empty()) {
                         cwd = value.into_owned();
@@ -303,7 +362,9 @@ pub fn parse_meta(path: &Path, bytes: &[u8], stamp: FileStamp) -> Option<Session
         }
     }
 
-    if user_turns == 0 {
+    // A fork that refers to its base's history is a session even before
+    // anything new is said in it.
+    if user_turns == 0 && !has_base {
         return None;
     }
     let id = id.filter(|id| !id.is_empty()).or_else(|| id_from_file_name(path))?;
@@ -358,21 +419,28 @@ struct IndexEntry {
     thread_name: Option<String>,
 }
 
-/// Reads `session_index.jsonl` into `id -> thread name`. Later lines win.
-pub fn read_titles(root: &Path) -> HashMap<String, String> {
-    let Ok(bytes) = fs::read(root.join(INDEX_FILE)) else {
-        return HashMap::new();
+/// Reads `session_index.jsonl` into `id -> thread name`. Later lines win;
+/// a name with nothing printable in it is ignored, so the session keeps
+/// falling back to its first prompt. A missing index has no titles.
+pub fn read_titles(root: &Path) -> std::io::Result<HashMap<String, String>> {
+    let bytes = match fs::read(root.join(INDEX_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
     };
     let mut titles = HashMap::new();
     for line in jsonl::lines(&bytes) {
         if let Ok(entry) = serde_json::from_slice::<IndexEntry>(line)
-            && let Some(name) = entry.thread_name.filter(|n| !n.trim().is_empty())
+            && let Some(name) = entry.thread_name.map(|n| text::summary(&n, 200)).filter(|n| !n.is_empty())
         {
-            titles.insert(entry.id, text::summary(&name, 200));
+            titles.insert(entry.id, name);
         }
     }
-    titles
+    Ok(titles)
 }
+
+/// Rollout files kept outside `sessions/` that may still refer to others.
+const ARCHIVE_DIR: &str = "archived_sessions";
 
 impl Provider for CodexProvider {
     fn kind(&self) -> AgentKind {
@@ -383,12 +451,9 @@ impl Provider for CodexProvider {
         &self.root
     }
 
-    fn discover(&self, errors: &mut Vec<String>) -> Vec<PathBuf> {
+    fn discover(&self, unread: &mut Unread) -> Vec<PathBuf> {
         let mut out = Vec::new();
-        let keep = |p: &Path| {
-            has_extension(p, "jsonl") && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
-        };
-        files_recursive(&self.root.join("sessions"), 4, &keep, &mut out, errors);
+        files_recursive(&self.root.join("sessions"), 4, &is_rollout, &mut out, unread);
         out
     }
 
@@ -397,19 +462,35 @@ impl Provider for CodexProvider {
         Ok(parse_meta(path, &bytes, stamp))
     }
 
-    fn decorate(&self, sessions: &mut [Session]) {
+    fn decorate(&self, sessions: &mut [Session], errors: &mut Vec<String>) {
         if sessions.is_empty() {
             return;
         }
-        let titles = self.titles();
+        let titles = self.titles(errors);
         for session in sessions {
             session.title = titles.get(&session.id).cloned();
         }
     }
 
+    /// The session's own records, preceded by the history it inherits from
+    /// its base when it is a fork that refers to it.
     fn transcript(&self, session: &Session) -> Result<Vec<Turn>> {
         let bytes = fs::read(&session.path).with_context(|| format!("reading {}", session.path.display()))?;
-        Ok(parse_transcript(&bytes))
+        let own = parse_transcript(&bytes);
+        let Some(thread) = read_thread(&session.path).ok().flatten().filter(|t| t.base.is_some()) else {
+            return Ok(own);
+        };
+        let mut turns = self.inherited(&thread, &session.path, 0).unwrap_or_else(|e| {
+            vec![Turn {
+                role: Role::Tool,
+                text: text::one_line(&format!("earlier history unavailable: {e:#}")),
+                timestamp: None,
+            }]
+        });
+        for turn in own {
+            push_turn(&mut turns, turn);
+        }
+        Ok(turns)
     }
 
     fn resume_command(&self, session: &Session) -> ResumeCommand {
@@ -422,30 +503,106 @@ impl Provider for CodexProvider {
     }
 
     /// The rollout file plus the files of every sub-agent it spawned (and
-    /// theirs, recursively).
-    fn related_paths(&self, session: &Session) -> Vec<PathBuf> {
-        let mut children: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
-        for file in self.discover(&mut Vec::new()) {
-            if file == session.path {
+    /// theirs, recursively). Refuses when a rollout file could not be read
+    /// (one of them might belong to the session), or when a fork that is
+    /// not being deleted refers to the history of one that is.
+    fn related_paths(&self, session: &Session) -> Result<Vec<PathBuf>> {
+        let threads = self.threads(true)?;
+        let mut children: HashMap<&str, Vec<(&str, &Path)>> = HashMap::new();
+        for (file, thread) in &threads {
+            if *file == session.path {
                 continue;
             }
-            if let Some((id, Some(Some(parent)))) = read_thread(&file) {
-                children.entry(parent).or_default().push((id, file));
+            if let Some(Some(parent)) = &thread.subagent_of {
+                children.entry(parent.as_str()).or_default().push((thread.id.as_str(), file.as_path()));
             }
         }
-        let mut found = Vec::new();
-        let mut parents = vec![session.id.clone()];
+        let mut found: Vec<PathBuf> = Vec::new();
+        let mut ids: Vec<&str> = vec![session.id.as_str()];
+        let mut parents = vec![session.id.as_str()];
         while let Some(parent) = parents.pop() {
             // `remove` also guards against cycles in broken metadata.
-            for (id, file) in children.remove(&parent).unwrap_or_default() {
-                found.push(file);
+            for (id, file) in children.remove(parent).unwrap_or_default() {
+                found.push(file.to_path_buf());
+                ids.push(id);
                 parents.push(id);
             }
         }
         found.sort();
         let mut paths = vec![session.path.clone()];
         paths.extend(found);
-        paths
+
+        let deleting: std::collections::HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        for (file, thread) in &threads {
+            if deleting.contains(file.as_path()) {
+                continue;
+            }
+            if let Some(base) = thread.base.as_deref().filter(|base| ids.contains(base)) {
+                anyhow::bail!(
+                    "cannot delete this session: Codex session {} is a fork that refers to the history of {base} \
+                     instead of copying it ({}); delete the fork first",
+                    text::one_line(&thread.id),
+                    file.display()
+                );
+            }
+        }
+        Ok(paths)
+    }
+}
+
+fn is_rollout(p: &Path) -> bool {
+    has_extension(p, "jsonl") && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("rollout-"))
+}
+
+impl CodexProvider {
+    /// Every rollout file (with `archived` also the archived ones) and how
+    /// it relates to others. Files that vanish meanwhile are skipped; any
+    /// other failure to read is an error, since the answer would be
+    /// incomplete.
+    fn threads(&self, archived: bool) -> Result<Vec<(PathBuf, Thread)>> {
+        let mut unread = Unread::default();
+        let mut files = self.discover(&mut unread);
+        if archived {
+            files_recursive(&self.root.join(ARCHIVE_DIR), 4, &is_rollout, &mut files, &mut unread);
+        }
+        if let Some(error) = unread.errors.first() {
+            anyhow::bail!("could not check every Codex session for related files: {error}");
+        }
+        let mut threads = Vec::with_capacity(files.len());
+        for file in files {
+            match read_thread(&file) {
+                Ok(Some(thread)) => threads.push((file, thread)),
+                Ok(None) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!(
+                    "could not check every Codex session for related files: cannot read {}: {e}",
+                    file.display()
+                ),
+            }
+        }
+        Ok(threads)
+    }
+
+    /// The turns `thread` inherits from its base, itself resolved the same
+    /// way. Depth-limited, so a cycle in broken metadata ends.
+    fn inherited(&self, thread: &Thread, own_path: &Path, depth: usize) -> Result<Vec<Turn>> {
+        let Some(base) = thread.base.as_deref() else { return Ok(Vec::new()) };
+        if depth >= 16 {
+            anyhow::bail!("Codex session {} refers to the history of others too deeply (a cycle?)", thread.id);
+        }
+        let threads = self.threads(true)?;
+        let Some((path, base_thread)) = threads.into_iter().find(|(path, t)| t.id == base && path != own_path) else {
+            anyhow::bail!(
+                "the history this fork continues (session {base}) is missing; only the fork's own part can be shown"
+            );
+        };
+        let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let end = thread.base_bytes.map_or(bytes.len(), |n| usize::try_from(n).unwrap_or(usize::MAX).min(bytes.len()));
+        let mut turns = self.inherited(&base_thread, &path, depth + 1)?;
+        for turn in parse_transcript(&bytes[..end]) {
+            push_turn(&mut turns, turn);
+        }
+        Ok(turns)
     }
 }
 
@@ -642,7 +799,7 @@ mod tests {
 
         let provider = CodexProvider::new(root.clone());
         let sessions: Vec<Session> = provider
-            .discover(&mut Vec::new())
+            .discover(&mut Default::default())
             .iter()
             .filter_map(|f| provider.parse(f, FileStamp::of(f).unwrap()).unwrap())
             .collect();
@@ -654,9 +811,9 @@ mod tests {
         let mut expected = vec![child, grandchild];
         expected.sort();
         expected.insert(0, parent);
-        assert_eq!(provider.related_paths(parent_session), expected);
+        assert_eq!(provider.related_paths(parent_session).unwrap(), expected);
         let other_session = sessions.iter().find(|s| s.id == ID).unwrap();
-        assert_eq!(provider.related_paths(other_session), vec![other]);
+        assert_eq!(provider.related_paths(other_session).unwrap(), vec![other]);
     }
 
     #[test]
@@ -671,17 +828,188 @@ mod tests {
         fx::write_index(&root, &[(ID, "Old name"), ("other", "Other"), (ID, "New name")]);
 
         let provider = CodexProvider::new(root.clone());
-        assert_eq!(provider.discover(&mut Vec::new()), vec![file.clone()]);
+        assert_eq!(provider.discover(&mut Default::default()), vec![file.clone()]);
         let mut sessions = vec![provider.parse(&file, FileStamp::of(&file).unwrap()).unwrap().unwrap()];
-        provider.decorate(&mut sessions);
+        provider.decorate(&mut sessions, &mut Vec::new());
         assert_eq!(sessions[0].title.as_deref(), Some("New name"));
-        provider.decorate(&mut sessions);
+        provider.decorate(&mut sessions, &mut Vec::new());
         assert_eq!(provider.title_reads.load(std::sync::atomic::Ordering::SeqCst), 1, "unchanged index is reused");
         fx::write_index(&root, &[(ID, "Newest name, longer")]);
-        provider.decorate(&mut sessions);
+        provider.decorate(&mut sessions, &mut Vec::new());
         assert_eq!(sessions[0].title.as_deref(), Some("Newest name, longer"));
-        assert_eq!(provider.related_paths(&sessions[0]), vec![file]);
+        assert_eq!(provider.related_paths(&sessions[0]).unwrap(), vec![file]);
         let cmd = provider.resume_command(&sessions[0]);
         assert_eq!((cmd.program.as_str(), cmd.args.clone()), ("codex", vec!["resume".to_string(), ID.to_string()]));
+    }
+
+    #[test]
+    fn every_non_root_source_shape_is_a_subagent() {
+        for source in [
+            serde_json::json!({"subagent": "review"}),
+            serde_json::json!({"subagent": "compact"}),
+            serde_json::json!({"subagent": "memory_consolidation"}),
+            serde_json::json!({"subagent": {"some_future_kind": {}}}),
+            serde_json::json!({"internal": "anything"}),
+            serde_json::json!("internal"),
+        ] {
+            let mut meta = fx::meta(CHILD, "/w", "2026-10-24T16:40:00Z");
+            meta["payload"]["source"] = source.clone();
+            let data = bytes(&[meta, fx::user("2026-10-24T16:39:01Z", "inherited prompt")]);
+            assert_eq!(parse_meta(&path(), &data, stamp()), None, "{source}");
+        }
+        for source in [serde_json::json!("cli"), serde_json::json!("vscode"), serde_json::json!({"mcp": {}})] {
+            let mut meta = fx::meta(ID, "/w", "2026-10-24T16:40:00Z");
+            meta["payload"]["source"] = source.clone();
+            let data = bytes(&[meta, fx::user("2026-10-24T16:39:01Z", "my prompt")]);
+            assert!(parse_meta(&path(), &data, stamp()).is_some(), "{source}");
+        }
+    }
+
+    #[test]
+    fn titles_with_nothing_printable_fall_back_to_the_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let file = fx::write_session(
+            &root,
+            ID,
+            &[fx::meta(ID, "/h", "2026-10-24T16:38:56Z"), fx::user("2026-10-24T16:39:01Z", "fallback prompt")],
+        );
+        fx::write_index(&root, &[(ID, "\u{7}\u{202e}")]);
+        let provider = CodexProvider::new(root);
+        let mut sessions = vec![provider.parse(&file, FileStamp::of(&file).unwrap()).unwrap().unwrap()];
+        provider.decorate(&mut sessions, &mut Vec::new());
+        assert_eq!(sessions[0].title, None);
+        assert_eq!(sessions[0].label(), "fallback prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_title_index_is_reported_and_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let file = fx::write_session(
+            &root,
+            ID,
+            &[fx::meta(ID, "/h", "2026-10-24T16:38:56Z"), fx::user("2026-10-24T16:39:01Z", "q")],
+        );
+        fx::write_index(&root, &[(ID, "Important title")]);
+        let index = root.join(INDEX_FILE);
+        let provider = CodexProvider::new(root.clone());
+        let mut sessions = vec![provider.parse(&file, FileStamp::of(&file).unwrap()).unwrap().unwrap()];
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&index).is_ok() {
+            return; // running as root
+        }
+        let mut errors = Vec::new();
+        provider.decorate(&mut sessions, &mut errors);
+        assert_eq!(sessions[0].title, None);
+        assert!(errors[0].contains("session_index"), "{errors:?}");
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+        provider.decorate(&mut sessions, &mut Vec::new());
+        assert_eq!(sessions[0].title.as_deref(), Some("Important title"), "retried once readable");
+        // A failed refresh keeps the titles already known.
+        fx::write_index(&root, &[(ID, "A newer, longer title")]);
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+        let mut errors = Vec::new();
+        provider.decorate(&mut sessions, &mut errors);
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(sessions[0].title.as_deref(), Some("Important title"));
+        assert_eq!(errors.len(), 1);
+        provider.decorate(&mut sessions, &mut Vec::new());
+        assert_eq!(sessions[0].title.as_deref(), Some("A newer, longer title"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subagent_stops_the_delete() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let parent = fx::write_session(
+            &root,
+            PARENT,
+            &[fx::meta(PARENT, "/w", "2026-10-24T16:38:56Z"), fx::user("2026-10-24T16:39:01Z", "review")],
+        );
+        let child = fx::write_session(&root, CHILD, &subagent_file(CHILD, PARENT));
+        let provider = CodexProvider::new(root.clone());
+        let session = provider.parse(&parent, FileStamp::of(&parent).unwrap()).unwrap().unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&child).is_ok() {
+            return; // running as root
+        }
+        let result = provider.related_paths(&session);
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("could not check"), "{err:#}");
+        assert_eq!(provider.related_paths(&session).unwrap(), vec![parent, child]);
+    }
+
+    /// A base session and a fork that refers to its first two records.
+    fn referenced_fork(root: &Path) -> (PathBuf, PathBuf) {
+        let base = fx::write_session(
+            root,
+            PARENT,
+            &[fx::meta(PARENT, "/w", "2026-10-24T16:38:56Z"), fx::user("2026-10-24T16:39:01Z", "inherited prompt")],
+        );
+        let inherited = fs::metadata(&base).unwrap().len();
+        // Later records in the base are not part of the fork.
+        let mut later = fs::read(&base).unwrap();
+        later.extend(bytes(&[fx::user("2026-10-24T16:45:00Z", "only in the base")]));
+        fs::write(&base, later).unwrap();
+        let mut meta = fx::meta(CHILD, "/w", "2026-10-24T16:40:00Z");
+        meta["payload"]["thread_source"] = serde_json::json!("user");
+        meta["payload"]["forked_from_id"] = serde_json::json!(PARENT);
+        meta["payload"]["history_mode"] = serde_json::json!("paginated");
+        meta["payload"]["history_base"] =
+            serde_json::json!({"thread_id": PARENT, "end_ordinal_exclusive": 2, "end_byte_offset": inherited});
+        let fork = fx::write_session(root, CHILD, &[meta, fx::user("2026-10-24T16:41:00Z", "fork prompt")]);
+        (base, fork)
+    }
+
+    #[test]
+    fn a_base_whose_history_a_fork_refers_to_cannot_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let (base, fork) = referenced_fork(&root);
+        let provider = CodexProvider::new(root.clone());
+        let base_session = provider.parse(&base, FileStamp::of(&base).unwrap()).unwrap().unwrap();
+        let fork_session = provider.parse(&fork, FileStamp::of(&fork).unwrap()).unwrap().unwrap();
+        let err = provider.related_paths(&base_session).unwrap_err();
+        assert!(err.to_string().contains("delete the fork first"), "{err}");
+        // The fork shows the history it continues, then its own.
+        let turns: Vec<String> = provider.transcript(&fork_session).unwrap().into_iter().map(|t| t.text).collect();
+        assert_eq!(turns, vec!["inherited prompt", "fork prompt"]);
+        // The fork itself can go; then so can the base.
+        assert_eq!(provider.related_paths(&fork_session).unwrap(), vec![fork.clone()]);
+        fs::remove_file(&fork).unwrap();
+        assert_eq!(provider.related_paths(&base_session).unwrap(), vec![base]);
+        // An archived fork protects its base too.
+        let archived = root.join(ARCHIVE_DIR).join("rollout-x.jsonl");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        let (base, fork) = referenced_fork(&root);
+        fs::rename(&fork, &archived).unwrap();
+        let base_session = provider.parse(&base, FileStamp::of(&base).unwrap()).unwrap().unwrap();
+        assert!(provider.related_paths(&base_session).is_err());
+    }
+
+    #[test]
+    fn a_fork_with_nothing_new_is_still_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let (_, fork) = referenced_fork(&root);
+        let lines: Vec<serde_json::Value> =
+            fs::read_to_string(&fork).unwrap().lines().take(1).map(|l| serde_json::from_str(l).unwrap()).collect();
+        fs::write(&fork, bytes(&lines)).unwrap();
+        let provider = CodexProvider::new(root);
+        let session = provider.parse(&fork, FileStamp::of(&fork).unwrap()).unwrap().expect("listed");
+        assert_eq!(session.user_turns, 0);
+        let turns: Vec<String> = provider.transcript(&session).unwrap().into_iter().map(|t| t.text).collect();
+        assert_eq!(turns, vec!["inherited prompt"]);
+        // Without its base, the fork's own part is still shown, with a note.
+        fs::remove_file(fx::session_path(&provider.root, PARENT)).unwrap();
+        let turns = provider.transcript(&session).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].text.contains("missing"), "{}", turns[0].text);
     }
 }

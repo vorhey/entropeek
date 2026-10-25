@@ -509,7 +509,7 @@ mod tests {
             fn root(&self) -> &std::path::Path {
                 std::path::Path::new("/nonexistent")
             }
-            fn discover(&self, _: &mut Vec<String>) -> Vec<std::path::PathBuf> {
+            fn discover(&self, _: &mut crate::provider::Unread) -> Vec<std::path::PathBuf> {
                 panic!("simulated worker panic")
             }
             fn parse(&self, _: &std::path::Path, _: crate::provider::FileStamp) -> Result<Option<Session>> {
@@ -521,7 +521,7 @@ mod tests {
             fn resume_command(&self, _: &Session) -> crate::provider::ResumeCommand {
                 unreachable!()
             }
-            fn related_paths(&self, _: &Session) -> Vec<std::path::PathBuf> {
+            fn related_paths(&self, _: &Session) -> Result<Vec<std::path::PathBuf>> {
                 unreachable!()
             }
         }

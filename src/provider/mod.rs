@@ -108,8 +108,8 @@ pub trait Provider: Send + Sync {
     fn root(&self) -> &Path;
 
     /// Candidate session files. Must be cheap: directory walks only.
-    /// Directories that exist but cannot be read are reported in `errors`.
-    fn discover(&self, errors: &mut Vec<String>) -> Vec<PathBuf>;
+    /// Directories that exist but cannot be read are reported in `unread`.
+    fn discover(&self, unread: &mut Unread) -> Vec<PathBuf>;
 
     /// Reads one session file into list metadata. `Ok(None)` means the file
     /// is not a usable session (for example, it has no user prompts), which
@@ -118,7 +118,8 @@ pub trait Provider: Send + Sync {
 
     /// Fills in data kept outside the session files (such as a title index).
     /// Runs on every scan, after cached and fresh sessions are merged.
-    fn decorate(&self, _sessions: &mut [Session]) {}
+    /// What could not be read goes to `errors`.
+    fn decorate(&self, _sessions: &mut [Session], _errors: &mut Vec<String>) {}
 
     /// The full conversation.
     fn transcript(&self, session: &Session) -> Result<Vec<Turn>>;
@@ -126,8 +127,32 @@ pub trait Provider: Send + Sync {
     fn resume_command(&self, session: &Session) -> ResumeCommand;
 
     /// Every file or directory that belongs to the session, starting with the
-    /// session file. A delete moves all of them to the trash.
-    fn related_paths(&self, session: &Session) -> Vec<PathBuf>;
+    /// session file. A delete moves all of them to the trash. Fails if the
+    /// list cannot be known to be complete (something could not be read),
+    /// or if deleting the session would break another one.
+    fn related_paths(&self, session: &Session) -> Result<Vec<PathBuf>>;
+}
+
+/// What a discovery walk could not read.
+#[derive(Debug, Default)]
+pub struct Unread {
+    /// What went wrong, for the user.
+    pub errors: Vec<String>,
+    /// Directories (or entries) whose sessions may be missing from the
+    /// result. Sessions known from before inside them are kept, not dropped
+    /// as deleted.
+    pub dirs: Vec<PathBuf>,
+}
+
+impl Unread {
+    pub fn add(&mut self, dir: &Path, error: &io::Error) {
+        self.errors.push(format!("cannot read {}: {error}", dir.display()));
+        self.dirs.push(dir.to_path_buf());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.errors.is_empty()
+    }
 }
 
 /// All supported providers, in [`AgentKind::ALL`] order.
@@ -161,36 +186,58 @@ pub(crate) fn push_turn(turns: &mut Vec<Turn>, turn: Turn) {
 }
 
 /// Opens a directory for listing. A missing directory is simply empty;
-/// any other failure is recorded in `errors`.
-fn read_dir(dir: &Path, errors: &mut Vec<String>) -> Option<fs::ReadDir> {
+/// any other failure is recorded in `unread`.
+fn read_dir(dir: &Path, unread: &mut Unread) -> Option<fs::ReadDir> {
     match fs::read_dir(dir) {
         Ok(entries) => Some(entries),
         Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => None,
         Err(e) => {
-            errors.push(format!("cannot read {}: {e}", dir.display()));
+            unread.add(dir, &e);
             None
         }
     }
 }
 
-/// Session files directly inside each subdirectory of `root`, matching `keep`.
-pub(crate) fn files_in_subdirs(root: &Path, keep: impl Fn(&Path) -> bool, errors: &mut Vec<String>) -> Vec<PathBuf> {
-    let Some(dirs) = read_dir(root, errors) else {
-        return Vec::new();
-    };
+/// The entries of `dir`; an error part way through is recorded.
+fn entries(dir: &Path, unread: &mut Unread) -> Vec<fs::DirEntry> {
+    let Some(list) = read_dir(dir, unread) else { return Vec::new() };
     let mut out = Vec::new();
-    for dir in dirs.flatten() {
-        // Plain files at this level (and dangling links) are not projects.
-        if !dir.path().is_dir() {
-            continue;
+    for entry in list {
+        match entry {
+            Ok(entry) => out.push(entry),
+            Err(e) => {
+                unread.add(dir, &e);
+                break;
+            }
         }
-        let Some(entries) = read_dir(&dir.path(), errors) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if keep(&path) && entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                out.push(path);
+    }
+    out
+}
+
+/// Session files directly inside each subdirectory of `root`, matching `keep`.
+pub(crate) fn files_in_subdirs(root: &Path, keep: impl Fn(&Path) -> bool, unread: &mut Unread) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in entries(root, unread) {
+        let path = dir.path();
+        // Plain files at this level (and dangling links) are not projects.
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                unread.add(&path, &e);
+                continue;
+            }
+        }
+        for entry in entries(&path, unread) {
+            let file = entry.path();
+            if !keep(&file) {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() => out.push(file),
+                Ok(_) => {}
+                Err(e) => unread.add(&file, &e),
             }
         }
     }
@@ -203,17 +250,20 @@ pub(crate) fn files_recursive(
     depth: usize,
     keep: &impl Fn(&Path) -> bool,
     out: &mut Vec<PathBuf>,
-    errors: &mut Vec<String>,
+    unread: &mut Unread,
 ) {
-    let Some(entries) = read_dir(root, errors) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    for entry in entries(root, unread) {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) => {
+                unread.add(&path, &e);
+                continue;
+            }
+        };
         if kind.is_dir() {
             if depth > 0 {
-                files_recursive(&path, depth - 1, keep, out, errors);
+                files_recursive(&path, depth - 1, keep, out, unread);
             }
         } else if kind.is_file() && keep(&path) {
             out.push(path);

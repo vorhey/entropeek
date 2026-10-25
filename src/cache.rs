@@ -83,6 +83,11 @@ impl Cache {
         self.entries.is_empty()
     }
 
+    /// Every entry, by session file.
+    pub fn iter(&self) -> impl Iterator<Item = (&Path, &CacheEntry)> {
+        self.entries.iter().map(|(path, entry)| (path.as_path(), entry))
+    }
+
     /// Replaces all entries; paths not present any more are dropped.
     pub fn replace(&mut self, entries: HashMap<PathBuf, CacheEntry>) {
         self.entries = entries;

@@ -13,7 +13,7 @@ use crate::trash::{Trash, TrashEntry};
 pub fn delete(providers: &[Box<dyn Provider>], trash: &Trash, session: &Session) -> Result<TrashEntry> {
     let provider =
         provider::find(providers, session.agent).with_context(|| format!("no provider for {}", session.agent.id()))?;
-    let paths = provider.related_paths(session);
+    let paths = provider.related_paths(session)?;
     trash.put(session, &paths, provider.root())
 }
 

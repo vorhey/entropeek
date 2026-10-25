@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use crate::cache::{Cache, CacheEntry};
 use crate::model::Session;
-use crate::provider::{FileStamp, Provider};
+use crate::provider::{FileStamp, Provider, Unread};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
@@ -45,22 +45,24 @@ enum Outcome {
 /// they were cached. Updates `cache` in place (the caller decides when to save).
 pub fn scan(providers: &[Box<dyn Provider>], cache: &mut Cache) -> Scan {
     let started = Instant::now();
-    // Per provider: (provider index, file) pairs and directory errors.
-    type Found = (Vec<(usize, PathBuf)>, Vec<String>);
+    // Per provider: (provider index, file) pairs and what could not be read.
+    type Found = (Vec<(usize, PathBuf)>, Unread);
     let discovered: Vec<Found> = providers
         .par_iter()
         .enumerate()
         .map(|(index, provider)| {
-            let mut errors = Vec::new();
-            let files = provider.discover(&mut errors).into_iter().map(|path| (index, path)).collect();
-            (files, errors)
+            let mut unread = Unread::default();
+            let files = provider.discover(&mut unread).into_iter().map(|path| (index, path)).collect();
+            (files, unread)
         })
         .collect();
     let mut errors = Vec::new();
     let mut found = Vec::new();
-    for (files, errs) in discovered {
+    let mut unread_dirs = Vec::new();
+    for (files, unread) in discovered {
         found.extend(files);
-        errors.extend(errs);
+        errors.extend(unread.errors);
+        unread_dirs.extend(unread.dirs);
     }
 
     let cache_ref = &*cache;
@@ -111,8 +113,21 @@ pub fn scan(providers: &[Box<dyn Provider>], cache: &mut Cache) -> Scan {
         }
         entries.insert(path, entry);
     }
+    // A directory that could not be listed says nothing about whether its
+    // sessions still exist: keep what was known about them until it can be
+    // read again.
+    if !unread_dirs.is_empty() {
+        for (path, entry) in cache.iter() {
+            if !entries.contains_key(path) && unread_dirs.iter().any(|dir| path.starts_with(dir)) {
+                if let Some(session) = &entry.session {
+                    sessions.push(session.clone());
+                }
+                entries.insert(path.to_path_buf(), entry.clone());
+            }
+        }
+    }
     cache.replace(entries);
-    let sessions = finalize(providers, sessions);
+    let sessions = finalize(providers, sessions, &mut errors);
     stats.elapsed = started.elapsed();
     Scan { sessions, stats, errors }
 }
@@ -125,11 +140,11 @@ pub fn cached(providers: &[Box<dyn Provider>], cache: &Cache) -> Vec<Session> {
     let in_scope = |s: &Session| {
         providers.iter().any(|p| p.kind() == s.agent && s.path.starts_with(p.root()) && s.path != p.root())
     };
-    finalize(providers, cache.sessions().into_iter().filter(in_scope).collect())
+    finalize(providers, cache.sessions().into_iter().filter(in_scope).collect(), &mut Vec::new())
 }
 
 /// Applies provider decorations and sorts newest first.
-fn finalize(providers: &[Box<dyn Provider>], mut sessions: Vec<Session>) -> Vec<Session> {
+fn finalize(providers: &[Box<dyn Provider>], mut sessions: Vec<Session>, errors: &mut Vec<String>) -> Vec<Session> {
     sessions.sort_by_key(|s| s.agent);
     let mut rest = sessions.as_mut_slice();
     while let Some(first) = rest.first() {
@@ -137,7 +152,7 @@ fn finalize(providers: &[Box<dyn Provider>], mut sessions: Vec<Session>) -> Vec<
         let len = rest.iter().take_while(|s| s.agent == agent).count();
         let (group, tail) = rest.split_at_mut(len);
         if let Some(provider) = providers.iter().find(|p| p.kind() == agent) {
-            provider.decorate(group);
+            provider.decorate(group, errors);
         }
         rest = tail;
     }
@@ -299,6 +314,30 @@ mod tests {
         let result = scan(&providers, &mut Cache::in_memory());
         fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.errors.iter().any(|e| e.contains("cannot read")), "{:?}", result.errors);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_keeps_its_known_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, env, providers) = setup();
+        testkit::populate(&env);
+        let mut cache = Cache::in_memory();
+        let before = scan(&providers, &mut cache).sessions;
+        let project = before.iter().find(|s| s.agent == AgentKind::Claude).unwrap().path.parent().unwrap().to_owned();
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::read_dir(&project).is_err(); // root reads anyway
+        let during = scan(&providers, &mut cache);
+        fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+        if denied {
+            assert!(!during.errors.is_empty());
+        }
+        assert_eq!(during.sessions, before, "nothing disappears because it could not be listed");
+        assert_eq!(cache.len(), before.len());
+        // Sessions really deleted meanwhile do go, once the directory is readable.
+        let gone = before.iter().find(|s| s.path.starts_with(&project)).unwrap();
+        fs::remove_file(&gone.path).unwrap();
+        assert_eq!(scan(&providers, &mut cache).sessions.len(), before.len() - 1);
     }
 
     #[test]
