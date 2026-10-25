@@ -314,6 +314,23 @@ fn relative_path_entries_cannot_swap_the_program() {
     let out = home.command(&["resume", id], "bin:/usr/bin:/bin").current_dir(&launcher).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "validated");
+
+    // The printed command runs the same program when pasted into a shell.
+    let printed =
+        home.command(&["resume", id, "--print"], "bin:/usr/bin:/bin").current_dir(&launcher).output().unwrap();
+    assert!(printed.status.success(), "{}", String::from_utf8_lossy(&printed.stderr));
+    let line = String::from_utf8(printed.stdout).unwrap();
+    let ran = std::process::Command::new("/bin/sh")
+        .args(["-c", line.trim()])
+        .env("PATH", "bin:/usr/bin:/bin")
+        .current_dir(&launcher)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(ran.stdout).unwrap().trim(), "validated", "{line}");
+    let listed = home.command(&["list", "--json"], "bin:/usr/bin:/bin").current_dir(&launcher).output().unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let row = listed.as_array().unwrap().iter().find(|s| s["id"] == id).unwrap();
+    assert_eq!(row["resume_command"].as_str().unwrap(), line.trim());
 }
 
 #[test]

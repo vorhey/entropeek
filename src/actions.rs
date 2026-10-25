@@ -29,9 +29,68 @@ pub fn restore(providers: &[Box<dyn Provider>], trash: &Trash, key: &str) -> Res
 pub fn resume_command(providers: &[Box<dyn Provider>], session: &Session) -> Result<ResumeCommand> {
     let provider =
         provider::find(providers, session.agent).with_context(|| format!("no provider for {}", session.agent.id()))?;
+    check_id(&session.id)?;
     let mut command = provider.resume_command(session);
     command.executable = Some(validate(&command, std::env::var_os("PATH"))?);
     Ok(command)
+}
+
+/// The command to print or copy for resuming `session`: what
+/// [`ResumeCommand::shell_line`] shows does what a direct resume would.
+/// The program keeps its plain name unless `PATH` finds it through a
+/// relative (or empty) entry; such an entry would mean a different
+/// directory after the `cd` into the workspace, so the program found now
+/// is shown by its absolute path instead.
+pub fn printable_command(providers: &[Box<dyn Provider>], session: &Session) -> Result<ResumeCommand> {
+    let provider =
+        provider::find(providers, session.agent).with_context(|| format!("no provider for {}", session.agent.id()))?;
+    check_id(&session.id)?;
+    let mut command = provider.resume_command(session);
+    command.executable = exported_program(&command.program);
+    Ok(command)
+}
+
+/// The shell line for [`printable_command`], or an empty string if the
+/// session cannot be resumed safely.
+pub fn printable_line(providers: &[Box<dyn Provider>], session: &Session) -> String {
+    printable_command(providers, session).map(|c| c.shell_line()).unwrap_or_default()
+}
+
+/// Session ids are passed to the agent as arguments. One that looks like an
+/// option (`--last`) would be read as one and resume a different session,
+/// so ids from malformed or hand-edited files are refused.
+fn check_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.starts_with('-') || id.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        bail!("this session's id {:?} cannot be passed to the agent safely", crate::text::one_line(id));
+    }
+    Ok(())
+}
+
+/// See [`printable_command`]. Looked up once per program: `PATH` does not
+/// change while entropeek runs.
+fn exported_program(name: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static FOUND: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
+    let mut found = FOUND.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    found.entry(name.to_string()).or_insert_with(|| export_lookup(name, std::env::var_os("PATH"))).clone()
+}
+
+/// `Some(absolute program)` when `PATH` finds `name` through a relative or
+/// empty entry; `None` when the plain name already means the same program
+/// everywhere (or is not found at all).
+pub fn export_lookup(name: &str, path_var: Option<OsString>) -> Option<PathBuf> {
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return (!path.is_absolute()).then(|| std::path::absolute(&path).unwrap_or(path));
+    }
+    for dir in std::env::split_paths(&path_var?) {
+        let candidate = dir.join(name);
+        if is_executable(&candidate) {
+            return (!dir.is_absolute()).then(|| std::path::absolute(&candidate).unwrap_or(candidate));
+        }
+    }
+    None
 }
 
 /// Checks that the workspace exists and the agent's program is installed,
@@ -60,11 +119,19 @@ pub fn find_program(name: &str, path_var: Option<OsString>) -> Option<PathBuf> {
     std::env::split_paths(&path_var?).map(|dir| absolute(dir.join(name))).find(|candidate| is_executable(candidate))
 }
 
+/// Whether this process may run `path`: a regular file that the kernel's
+/// own permission check (with the effective user and groups, and any ACLs)
+/// lets us execute. An execute bit for someone else is not enough.
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+        use std::os::unix::ffi::OsStrExt;
+        if !path.metadata().is_ok_and(|m| m.is_file()) {
+            return false;
+        }
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+        // SAFETY: a valid NUL-terminated path; faccessat only checks access.
+        unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
     }
     #[cfg(not(unix))]
     {
@@ -147,6 +214,60 @@ mod tests {
             out.push(part);
         }
         out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_lookup_skips_programs_this_user_cannot_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (bad, good) = (dir.path().join("bad"), dir.path().join("good"));
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        fake_program(&good, "claude");
+        std::fs::write(bad.join("claude"), "#!/bin/sh\n").unwrap();
+        // Executable by others, not by its owner.
+        std::fs::set_permissions(bad.join("claude"), std::fs::Permissions::from_mode(0o641)).unwrap();
+        let path = std::env::join_paths([&bad, &good]).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(find_program("claude", Some(path)), Some(good.join("claude")));
+        }
+    }
+
+    #[test]
+    fn exported_commands_only_pin_programs_found_through_relative_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_program(dir.path(), "claude");
+        let absolute = Some(dir.path().as_os_str().to_owned());
+        assert_eq!(export_lookup("claude", absolute), None, "an absolute entry means the same after `cd`");
+        let cwd = std::env::current_dir().unwrap();
+        let relative = pathdiff(dir.path(), &cwd).into_os_string();
+        let pinned = export_lookup("claude", Some(relative)).unwrap();
+        assert!(pinned.is_absolute());
+        assert_eq!(pinned.canonicalize().unwrap(), dir.path().join("claude").canonicalize().unwrap());
+        let cmd = ResumeCommand {
+            program: "claude".into(),
+            args: vec!["--resume".into(), "abc".into()],
+            cwd: "/w".into(),
+            executable: Some("/opt/bin/claude".into()),
+        };
+        assert_eq!(cmd.shell_line(), "cd /w && /opt/bin/claude --resume abc");
+    }
+
+    #[test]
+    fn ids_that_look_like_options_are_refused() {
+        assert!(check_id("01a16ec7-96b5-7c11-b69f-156e8bb6ba12").is_ok());
+        for bad in ["--last", "-x", "", "a b", "a\u{7}"] {
+            assert!(check_id(bad).is_err(), "{bad:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let providers = provider::all(&Env::under(dir.path()));
+        let mut session = crate::model::sample_session(crate::model::AgentKind::Codex, "--last");
+        session.cwd = dir.path().to_string_lossy().into_owned();
+        assert!(resume_command(&providers, &session).is_err());
+        assert!(printable_command(&providers, &session).is_err());
+        assert_eq!(printable_line(&providers, &session), "");
     }
 
     #[test]

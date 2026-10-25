@@ -184,8 +184,7 @@ pub fn run(command: Command, ctx: &Runtime, out: &mut dyn Write) -> Result<Outco
             let sessions = ctx.sessions();
             let session = search::find(&sessions, &selector)?;
             if print {
-                let provider = provider::find(&ctx.providers, session.agent).context("unknown agent")?;
-                writeln!(out, "{}", provider.resume_command(session).shell_line())?;
+                writeln!(out, "{}", actions::printable_command(&ctx.providers, session)?.shell_line())?;
             } else {
                 return Ok(Outcome::Exec(actions::resume_command(&ctx.providers, session)?));
             }
@@ -330,7 +329,7 @@ impl<'a> JsonSession<'a> {
             user_turns: s.user_turns,
             size: s.size,
             path: s.path.to_string_lossy().into_owned(),
-            resume_command: provider::find(&ctx.providers, s.agent).map(|p| p.resume_command(s).shell_line()),
+            resume_command: actions::printable_command(&ctx.providers, s).ok().map(|c| c.shell_line()),
         }
     }
 }

@@ -27,7 +27,6 @@ use ratatui::crossterm::{cursor, execute, terminal as tty};
 use crate::cache::Cache;
 use crate::cli::{Outcome, Runtime};
 use crate::model::Session;
-use crate::provider;
 use crate::timefmt;
 use crate::trash::Trash;
 use app::{App, Effect, Msg, PreviewKey, SearchEdit};
@@ -51,9 +50,9 @@ const TERMINAL_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
 pub fn run(rt: &Runtime) -> Result<Outcome> {
     let providers = rt.providers.clone();
     let for_resume = providers.clone();
-    let resume_line = Box::new(move |s: &Session| {
-        provider::find(&for_resume, s.agent).map(|p| p.resume_command(s).shell_line()).unwrap_or_default()
-    });
+    // The program lookup this needs is memoized per program, so copying a
+    // command touches the disk at most once per agent.
+    let resume_line = Box::new(move |s: &Session| crate::actions::printable_line(&for_resume, s));
     // The list starts empty; the scan worker loads the cache from disk and
     // sends what it knows first, so the first frame never waits on disk.
     let mut app = App::new(Vec::new(), rt.env.home_str(), timefmt::now_ms(), resume_line);
@@ -357,6 +356,7 @@ mod tests {
     use super::*;
     use crate::env::Env;
     use crate::index;
+    use crate::provider;
     use crate::testkit;
     use jobs::Providers;
     use ratatui::backend::TestBackend;

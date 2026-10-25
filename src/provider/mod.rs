@@ -54,15 +54,23 @@ pub struct ResumeCommand {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// The resolved program, filled in by [`crate::actions::resume_command`].
+    /// The resolved program, filled in by [`crate::actions::resume_command`]
+    /// (and by [`crate::actions::printable_command`] when the plain name
+    /// could mean another program after changing directory).
     #[serde(skip)]
     pub executable: Option<PathBuf>,
 }
 
 impl ResumeCommand {
     /// A copy-pasteable shell line, e.g. `cd ~/x && claude --resume abc`.
+    /// A resolved [`ResumeCommand::executable`] is used instead of the
+    /// program's name, so the line runs the same program.
     pub fn shell_line(&self) -> String {
-        let mut parts = vec![shell_quote(&self.program)];
+        let program = match &self.executable {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None => self.program.clone(),
+        };
+        let mut parts = vec![shell_quote(&program)];
         parts.extend(self.args.iter().map(|a| shell_quote(a)));
         let command = parts.join(" ");
         if self.cwd.as_os_str().is_empty() {
