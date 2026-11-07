@@ -205,6 +205,8 @@ impl Theme {
             (AgentKind::Codex, Mode::Light) => (hex(0x0969DA), white),
             (AgentKind::Claude, Mode::Dark) => (hex(0xD2A8FF), hex(0x0D1117)),
             (AgentKind::Claude, Mode::Light) => (hex(0x8250DF), white),
+            (AgentKind::OpenCode, Mode::Dark) => (hex(0x2DD4BF), hex(0x0D1117)),
+            (AgentKind::OpenCode, Mode::Light) => (hex(0x0F766E), white),
         }
     }
 }

@@ -15,6 +15,9 @@ pub struct Env {
     pub claude_dir: PathBuf,
     /// Codex's data directory (`~/.codex`, or `$CODEX_HOME`).
     pub codex_dir: PathBuf,
+    /// OpenCode's database (`opencode.db` in its data directory,
+    /// `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode`; or `$OPENCODE_DB`).
+    pub opencode_db: PathBuf,
     /// Where the session index cache lives.
     pub cache_dir: PathBuf,
     /// Where deleted sessions are kept until purged.
@@ -51,6 +54,7 @@ impl Env {
             home: std::path::absolute(home).unwrap_or_else(|_| home.to_path_buf()),
             claude_dir: dir("CLAUDE_CONFIG_DIR", home.join(".claude")),
             codex_dir: dir("CODEX_HOME", home.join(".codex")),
+            opencode_db: opencode_db(dir("XDG_DATA_HOME", home.join(".local/share")).join("opencode"), &var),
             cache_dir: dir("ENTROPEEK_CACHE_DIR", system_cache.join("entropeek")),
             data_dir: dir("ENTROPEEK_DATA_DIR", system_data.join("entropeek")),
         }
@@ -70,6 +74,16 @@ impl Env {
     }
 }
 
+/// Where OpenCode keeps its database, found the way OpenCode finds it: in
+/// its `data` directory (under the XDG data directory on every platform,
+/// macOS included), or `OPENCODE_DB` relative to that directory unless
+/// absolute. An in-memory database (`:memory:`) has nothing to read, so
+/// the default is used.
+fn opencode_db(data: PathBuf, var: &impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let db = var("OPENCODE_DB").filter(|value| !value.is_empty() && value != ":memory:");
+    data.join(db.unwrap_or_else(|| "opencode.db".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +93,7 @@ mod tests {
         let env = Env::under(Path::new("/h"));
         assert_eq!(env.claude_dir, PathBuf::from("/h/.claude"));
         assert_eq!(env.codex_dir, PathBuf::from("/h/.codex"));
+        assert_eq!(env.opencode_db, PathBuf::from("/h/.local/share/opencode/opencode.db"));
         assert_eq!(env.cache_dir, PathBuf::from("/h/.cache/entropeek"));
         assert_eq!(env.trash_dir(), PathBuf::from("/h/.local/share/entropeek/trash"));
     }
@@ -96,6 +111,25 @@ mod tests {
         assert_eq!(env.codex_dir, PathBuf::from("/codex"));
         assert_eq!(env.cache_dir, PathBuf::from("/c/entropeek"));
         assert_eq!(env.data_dir, PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn opencode_db_follows_opencode() {
+        let db = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            Env::from_vars(Path::new("/h"), "/c".into(), "/d".into(), |key| {
+                vars.iter().find(|(k, _)| k == key).map(|(_, v)| v.into())
+            })
+            .opencode_db
+        };
+        assert_eq!(db(&[("XDG_DATA_HOME", "/xdg")]), PathBuf::from("/xdg/opencode/opencode.db"));
+        assert_eq!(db(&[("XDG_DATA_HOME", "")]), PathBuf::from("/h/.local/share/opencode/opencode.db"));
+        assert_eq!(db(&[("OPENCODE_DB", "other.db")]), PathBuf::from("/h/.local/share/opencode/other.db"));
+        assert_eq!(
+            db(&[("OPENCODE_DB", "/elsewhere/oc.db"), ("XDG_DATA_HOME", "/xdg")]),
+            PathBuf::from("/elsewhere/oc.db")
+        );
+        assert_eq!(db(&[("OPENCODE_DB", ":memory:")]), PathBuf::from("/h/.local/share/opencode/opencode.db"));
     }
 
     #[test]

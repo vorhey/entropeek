@@ -81,7 +81,7 @@ pub enum Command {
 pub struct ListArgs {
     #[arg(long)]
     pub json: bool,
-    /// Only this agent (claude, codex).
+    /// Only this agent (claude, codex, opencode).
     #[arg(long)]
     pub agent: Option<String>,
     /// Only sessions matching all these words.
@@ -196,6 +196,9 @@ pub fn run(command: Command, ctx: &Runtime, out: &mut dyn Write) -> Result<Outco
             }
             let sessions = ctx.sessions();
             let session = search::find(&sessions, &selector)?;
+            if let Some(reason) = session.agent.cannot_delete(&session.id) {
+                bail!("{reason}");
+            }
             if !yes {
                 if !io::stdin().is_terminal() {
                     bail!("refusing to delete without confirmation; pass --yes");
@@ -231,7 +234,8 @@ pub fn run(command: Command, ctx: &Runtime, out: &mut dyn Write) -> Result<Outco
 fn list(ctx: &Runtime, args: &ListArgs, out: &mut dyn Write) -> Result<()> {
     let agent = match &args.agent {
         Some(name) => Some(
-            AgentKind::from_id(name).with_context(|| format!("unknown agent {name:?} (expected: claude, codex)"))?,
+            AgentKind::from_id(name)
+                .with_context(|| format!("unknown agent {name:?} (expected: claude, codex, opencode)"))?,
         ),
         None => None,
     };
@@ -360,7 +364,7 @@ fn write_table_with(
     writeln!(
         out,
         "{}  {}  {}  {}  TITLE",
-        text::fit("AGENT", 6),
+        text::fit("AGENT", AgentKind::longest_id()),
         text::fit_right("AGE", 4),
         text::fit("ID", id_width),
         text::fit("WORKSPACE", 28)
@@ -371,7 +375,7 @@ fn write_table_with(
         writeln!(
             out,
             "{}  {}  {}  {}  {}",
-            text::fit(s.agent.id(), 6),
+            text::fit(s.agent.id(), AgentKind::longest_id()),
             text::fit_right(&timefmt::relative(s.updated_at, now), 4),
             text::fit(&id, id_width),
             text::fit(&workspace, 28),
@@ -385,7 +389,13 @@ fn write_table_with(
 /// most recent deletion of a session, so older deletions of the same
 /// session show the key that selects them.
 fn write_trash_table(out: &mut dyn Write, entries: &[TrashEntry], now: i64) -> io::Result<()> {
-    writeln!(out, "{}  {}  {}  TITLE", text::fit("DELETED", 7), text::fit("AGENT", 6), text::fit("SESSION", 36))?;
+    writeln!(
+        out,
+        "{}  {}  {}  TITLE",
+        text::fit("DELETED", 7),
+        text::fit("AGENT", AgentKind::longest_id()),
+        text::fit("SESSION", 36)
+    )?;
     let mut seen = std::collections::HashSet::new();
     for e in entries {
         let mut note = String::new();
@@ -399,7 +409,7 @@ fn write_trash_table(out: &mut dyn Write, entries: &[TrashEntry], now: i64) -> i
             out,
             "{}  {}  {}  {}{note}",
             text::fit_right(&timefmt::relative(e.deleted_at, now), 7),
-            text::fit(e.session.agent.id(), 6),
+            text::fit(e.session.agent.id(), AgentKind::longest_id()),
             text::fit(&text::one_line(&e.session.id), 36),
             text::one_line(e.session.label())
         )?;

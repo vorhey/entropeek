@@ -13,8 +13,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
-use super::content::{Block, extract};
-use super::{FileStamp, Provider, ResumeCommand, Unread, files_in_subdirs, has_extension, push_turn};
+use super::content::extract;
+use super::{
+    FileStamp, Provider, ResumeCommand, Unread, files_in_subdirs, has_extension, push_block, push_turn, title,
+};
 use crate::jsonl::{self, Marker};
 use crate::model::{AgentKind, Role, Session, Turn};
 use crate::text;
@@ -112,11 +114,6 @@ impl Markers {
     fn may_hold_prompt(&self, line: &[u8]) -> bool {
         self.prompt_blocks.iter().any(|m| m.in_line(line))
     }
-}
-
-/// A title as shown, or `None` if nothing printable is left.
-fn title(value: &str) -> Option<String> {
-    Some(text::summary(value, 200)).filter(|t| !t.is_empty())
 }
 
 /// Parses session metadata from the raw bytes of a Claude session file.
@@ -221,13 +218,7 @@ pub fn parse_transcript(bytes: &[u8]) -> Vec<Turn> {
         };
         // In the order written: text, a tool call, more text…
         for block in extract(content).blocks {
-            match block {
-                Block::Text(t) => {
-                    push_turn(&mut turns, Turn { role: Role::Assistant, text: text::transcript_text(&t), timestamp })
-                }
-                Block::Tool(tool) => turns.push(Turn { role: Role::Tool, text: text::one_line(&tool), timestamp }),
-                Block::Attachment | Block::ToolResult => {}
-            }
+            push_block(&mut turns, block, timestamp);
         }
     }
     turns

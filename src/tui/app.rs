@@ -952,6 +952,10 @@ impl App {
     /// `d` down (or a terminal repeating it) can never delete anything.
     fn arm_delete(&mut self) {
         let Some(session) = self.selected_session().cloned() else { return };
+        if let Some(reason) = session.agent.cannot_delete(&session.id) {
+            self.error(reason);
+            return;
+        }
         if self.pending_deletes.contains(&session.path) {
             self.info("already moving this session to the trash…");
             return;
@@ -1460,6 +1464,19 @@ mod tests {
         app.handle_key(ch('9')); // no such agent
         app.handle_key(ch('2'));
         assert_eq!(row_labels(&app).len(), 6);
+    }
+
+    #[test]
+    fn opencode_sessions_are_never_armed_for_delete() {
+        let opencode = session(AgentKind::OpenCode, "ses_1", "/a", 500, "open code");
+        let mut app = App::new(vec![opencode], "/home/u".into(), 1_000, Box::new(|s| format!("resume {}", s.id)));
+        assert_eq!(app.handle_key(ch('d')), None);
+        assert!(app.delete_armed.is_none());
+        let status = app.status.as_ref().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(status.text.contains("opencode session delete ses_1"), "{}", status.text);
+        assert!(!matches!(app.handle_key(ch('y')), Some(Effect::Delete(_))));
+        assert!(!app.mutating());
     }
 
     #[test]

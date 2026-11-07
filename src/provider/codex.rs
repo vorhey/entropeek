@@ -431,7 +431,7 @@ pub fn read_titles(root: &Path) -> std::io::Result<HashMap<String, String>> {
     let mut titles = HashMap::new();
     for line in jsonl::lines(&bytes) {
         if let Ok(entry) = serde_json::from_slice::<IndexEntry>(line)
-            && let Some(name) = entry.thread_name.map(|n| text::summary(&n, 200)).filter(|n| !n.is_empty())
+            && let Some(name) = entry.thread_name.as_deref().and_then(super::title)
         {
             titles.insert(entry.id, name);
         }

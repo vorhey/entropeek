@@ -1,7 +1,7 @@
 # entropeek
 
 A fast terminal UI to **browse, preview, resume and delete** your coding-agent
-sessions. Supports **Claude Code** and **Codex**.
+sessions. Supports **Claude Code**, **Codex** and **OpenCode**.
 
 Inspired by [showagent](https://github.com/aytzey/showagent), without the
 cross-agent hand-off, and built to stay instant with thousands of sessions.
@@ -101,8 +101,8 @@ Press `i` to switch icons; the status line also says what the detection
 decided and why.
 
 A session can be named by its id, any unique id prefix of 4+ characters,
-`claude:<id>` / `codex:<id>` when two agents use the same id, or the path
-of its file. If a name matches more than one session, entropeek says so
+`claude:<id>` / `codex:<id>` / `opencode:<id>` when two agents use the same
+id, or the path of its file. If a name matches more than one session, entropeek says so
 instead of picking one. `delete` never accepts `latest`.
 
 ### Keys
@@ -134,8 +134,15 @@ instead of picking one. `delete` never accepts `latest`.
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/<dir>/<id>.jsonl` (`$CLAUDE_CONFIG_DIR`) | `/rename` title, else the generated title | `claude --resume <id>` in the session's folder |
 | Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`$CODEX_HOME`) | thread name from `session_index.jsonl` | `codex resume <id>` in the session's folder |
+| OpenCode | `~/.local/share/opencode/opencode.db` (`$XDG_DATA_HOME`, `$OPENCODE_DB`) | the session's title | `opencode --session <id>` in the session's folder |
 
 - **Read-only** except for deletes. Agent files are never modified.
+- **OpenCode** keeps sessions in a SQLite database, which entropeek only opens
+  read-only (without even creating its `-wal`/`-shm` files when OpenCode is
+  not running). Its sub-agent and archived sessions are not listed. Its
+  sessions cannot be deleted from entropeek: the trash only moves files, and
+  OpenCode may be writing to the database. `d` and `entropeek delete` say so
+  and give the command that does it: `opencode session delete <id>`.
 - **Delete moves to a trash** at `~/.local/share/entropeek/trash` (`$ENTROPEEK_DATA_DIR`).
   For Claude it also takes the session's subagent folder, `session-env/<id>`,
   `file-history/<id>` and todos. The trash is built so files are not lost:
@@ -175,13 +182,14 @@ instead of picking one. `delete` never accepts `latest`.
   - The files of an entry are plain files in `<entry>/items/<n>`, so they can
     always be recovered by hand using the manifest.
 - **Cache** at `~/.cache/entropeek/index.bin` (`$ENTROPEEK_CACHE_DIR`): parsed
-  metadata keyed by file path, modification time and size. A file that cannot
+  metadata keyed by file path, modification time and size (for OpenCode, by
+  session, its update time and its messages' count and sequence). A file that cannot
   be read is reported and retried, never remembered as empty. `--no-cache`
   ignores the cache.
 - entropeek's own directories are kept private to you (`0700`, tightened if
   they already existed) and its files are written atomically as new `0600`
   files. Trashed files keep their own permissions inside the private trash.
-- Relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `ENTROPEEK_*` values are resolved
+- Relative `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`, `ENTROPEEK_*` values are resolved
   once against the directory entropeek starts in. Resume runs the agent
   program found on `PATH` at that moment, by its absolute path; printed and
   copied commands use that path too when `PATH` found it through a relative
@@ -245,6 +253,7 @@ Point entropeek at the sample data with:
 
 ```sh
 HOME=/tmp/fake CLAUDE_CONFIG_DIR=/tmp/fake/.claude CODEX_HOME=/tmp/fake/.codex \
+  XDG_DATA_HOME=/tmp/fake/.local/share OPENCODE_DB= \
   ENTROPEEK_CACHE_DIR=/tmp/fake/.cache ENTROPEEK_DATA_DIR=/tmp/fake/.data entropeek
 ```
 
@@ -252,7 +261,7 @@ HOME=/tmp/fake CLAUDE_CONFIG_DIR=/tmp/fake/.claude CODEX_HOME=/tmp/fake/.codex \
 
 | Path | What |
 |---|---|
-| `src/provider/` | one file per agent (`claude.rs`, `codex.rs`) implementing `Provider` |
+| `src/provider/` | one file per agent (`claude.rs`, `codex.rs`, `opencode.rs`) implementing `Provider` |
 | `src/index.rs`, `src/cache.rs` | parallel scan with the mtime/size cache |
 | `src/trash.rs`, `src/actions.rs` | recoverable delete, restore, resume |
 | `src/fsutil.rs` | no-overwrite renames, private atomic writes, real-path checks |
@@ -263,11 +272,13 @@ HOME=/tmp/fake CLAUDE_CONFIG_DIR=/tmp/fake/.claude CODEX_HOME=/tmp/fake/.codex \
 | `src/tui/theme.rs` | light and dark palettes (showagent's colors) |
 | `src/tui/terminal.rs` | the startup query: background color, terminal version, kitty's font |
 | `src/tui/icons.rs` | Nerd Font glyphs and deciding whether the terminal can show them |
-| `src/testkit.rs` | builders for realistic Claude/Codex session files |
+| `src/testkit.rs` | builders for realistic Claude/Codex session files and OpenCode databases |
 | `tests/cli.rs` | end-to-end tests running the binary on a fake home |
 
 To add an agent: implement `Provider` in `src/provider/<agent>.rs`, add it to
-`AgentKind` and `provider::all`, and add fixtures to `testkit`.
+`AgentKind` and `provider::all`, and add fixtures to `testkit`. An agent that
+keeps its sessions in a database rather than a file each lists them with
+`Provider::read_all` (see `opencode.rs`).
 
 ## License
 

@@ -3,6 +3,7 @@
 pub mod claude;
 pub mod codex;
 pub mod content;
+pub mod opencode;
 
 use std::fs;
 use std::io;
@@ -12,6 +13,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheEntry;
 use crate::env::Env;
 use crate::model::{AgentKind, Role, Session, Turn};
 
@@ -124,6 +126,16 @@ pub trait Provider: Send + Sync {
     /// is safe to remember; `Err` means it could not be read right now.
     fn parse(&self, path: &Path, stamp: FileStamp) -> Result<Option<Session>>;
 
+    /// For agents that keep every session in one database instead of a file
+    /// each (OpenCode; `discover` then finds nothing): every session's entry,
+    /// keyed by a path inside [`Provider::root`] that stands for it. Each is
+    /// stamped so that an unchanged session reuses what `cached` returns for
+    /// its path and stamp instead of being read again. Agents that keep a
+    /// file per session have nothing here.
+    fn read_all(&self, _cached: &dyn Fn(&Path, FileStamp) -> Option<CacheEntry>) -> Result<Stored> {
+        Ok(Vec::new())
+    }
+
     /// Fills in data kept outside the session files (such as a title index).
     /// Runs on every scan, after cached and fresh sessions are merged.
     /// What could not be read goes to `errors`.
@@ -140,6 +152,9 @@ pub trait Provider: Send + Sync {
     /// or if deleting the session would break another one.
     fn related_paths(&self, session: &Session) -> Result<Vec<PathBuf>>;
 }
+
+/// Sessions read by [`Provider::read_all`], each with the path standing for it.
+pub type Stored = Vec<(PathBuf, CacheEntry)>;
 
 /// What a discovery walk could not read.
 #[derive(Debug, Default)]
@@ -168,6 +183,7 @@ pub fn all(env: &Env) -> Vec<Box<dyn Provider>> {
     vec![
         Box::new(claude::ClaudeProvider::new(env.claude_dir.clone())),
         Box::new(codex::CodexProvider::new(env.codex_dir.clone())),
+        Box::new(opencode::OpenCodeProvider::new(env.opencode_db.clone())),
     ]
 }
 
@@ -191,6 +207,25 @@ pub(crate) fn push_turn(turns: &mut Vec<Turn>, turn: Turn) {
         return;
     }
     turns.push(turn);
+}
+
+/// Appends an assistant content block: text is shown, a tool call is a
+/// one-line summary, and attachments or tool results are skipped.
+pub(crate) fn push_block(turns: &mut Vec<Turn>, block: content::Block, timestamp: Option<i64>) {
+    match block {
+        content::Block::Text(t) => {
+            push_turn(turns, Turn { role: Role::Assistant, text: crate::text::transcript_text(&t), timestamp })
+        }
+        content::Block::Tool(tool) => {
+            turns.push(Turn { role: Role::Tool, text: crate::text::one_line(&tool), timestamp })
+        }
+        content::Block::Attachment | content::Block::ToolResult => {}
+    }
+}
+
+/// A title as shown, or `None` if nothing printable is left.
+pub(crate) fn title(value: &str) -> Option<String> {
+    Some(crate::text::summary(value, 200)).filter(|t| !t.is_empty())
 }
 
 /// Opens a directory for listing. A missing directory is simply empty;

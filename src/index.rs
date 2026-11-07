@@ -66,24 +66,46 @@ pub fn scan(providers: &[Box<dyn Provider>], cache: &mut Cache) -> Scan {
     }
 
     let cache_ref = &*cache;
-    let results: Vec<(PathBuf, Outcome)> = found
-        .into_par_iter()
-        .map(|(index, path)| {
-            let previous = || cache_ref.entry(&path).cloned();
-            let outcome = match FileStamp::try_of(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outcome::Gone,
-                Err(e) => Outcome::Failed(format!("cannot read {}: {e}", path.display()), previous()),
-                Ok(stamp) => match cache_ref.get(&path, stamp) {
-                    Some(entry) => Outcome::Reused(entry.clone()),
-                    None => match providers[index].parse(&path, stamp) {
-                        Ok(session) => Outcome::Parsed(CacheEntry { stamp, session }),
-                        Err(e) => Outcome::Failed(format!("{e:#}"), previous()),
-                    },
-                },
-            };
-            (path, outcome)
-        })
-        .collect();
+    // Sessions kept in a database are read while the files are parsed.
+    let (stored, mut results) = rayon::join(
+        || {
+            providers
+                .iter()
+                .map(|provider| (provider.root(), read_stored(provider.as_ref(), cache_ref)))
+                .collect::<Vec<_>>()
+        },
+        || {
+            found
+                .into_par_iter()
+                .map(|(index, path)| {
+                    let previous = || cache_ref.entry(&path).cloned();
+                    let outcome = match FileStamp::try_of(&path) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Outcome::Gone,
+                        Err(e) => Outcome::Failed(format!("cannot read {}: {e}", path.display()), previous()),
+                        Ok(stamp) => match cache_ref.get(&path, stamp) {
+                            Some(entry) => Outcome::Reused(entry.clone()),
+                            None => match providers[index].parse(&path, stamp) {
+                                Ok(session) => Outcome::Parsed(CacheEntry { stamp, session }),
+                                Err(e) => Outcome::Failed(format!("{e:#}"), previous()),
+                            },
+                        },
+                    };
+                    (path, outcome)
+                })
+                .collect::<Vec<_>>()
+        },
+    );
+    // A database that cannot be read is reported, and the sessions known
+    // from it are kept, like those of a directory that cannot be listed.
+    for (root, outcomes) in stored {
+        match outcomes {
+            Ok(outcomes) => results.extend(outcomes),
+            Err(error) => {
+                errors.push(error);
+                unread_dirs.push(root.to_path_buf());
+            }
+        }
+    }
 
     let mut stats = ScanStats { files: results.len(), failed: errors.len(), ..ScanStats::default() };
     let mut entries = HashMap::with_capacity(results.len());
@@ -130,6 +152,17 @@ pub fn scan(providers: &[Box<dyn Provider>], cache: &mut Cache) -> Scan {
     let sessions = finalize(providers, sessions, &mut errors);
     stats.elapsed = started.elapsed();
     Scan { sessions, stats, errors }
+}
+
+/// The sessions of an agent that keeps them in a database, as scan outcomes.
+fn read_stored(provider: &dyn Provider, cache: &Cache) -> Result<Vec<(PathBuf, Outcome)>, String> {
+    let entries = provider.read_all(&|path, stamp| cache.get(path, stamp).cloned()).map_err(|e| format!("{e:#}"))?;
+    let outcomes = entries.into_iter().map(|(path, entry)| {
+        let outcome =
+            if cache.get(&path, entry.stamp).is_some() { Outcome::Reused(entry) } else { Outcome::Parsed(entry) };
+        (path, outcome)
+    });
+    Ok(outcomes.collect())
 }
 
 /// The sessions currently in the cache, decorated and sorted, without
@@ -354,6 +387,29 @@ mod tests {
         let only_codex: Vec<Box<dyn Provider>> =
             provider::all(&env).into_iter().filter(|p| p.kind() == AgentKind::Codex).collect();
         assert_eq!(cached(&only_codex, &cache).len(), 1);
+    }
+
+    #[test]
+    fn database_sessions_are_cached_and_kept_while_unreadable() {
+        let (_dir, env, providers) = setup();
+        let ids = testkit::opencode::sample(&env);
+        let mut cache = Cache::in_memory();
+        let first = scan(&providers, &mut cache);
+        let got: Vec<&str> = first.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(got, ids);
+        assert_eq!((first.stats.files, first.stats.parsed), (2, 2));
+        let second = scan(&providers, &mut cache);
+        assert_eq!((second.stats.parsed, second.stats.reused), (0, 2));
+        assert_eq!(second.sessions, first.sessions);
+        assert_eq!(cached(&providers, &cache), first.sessions, "shown from the cache before a scan");
+
+        fs::write(&env.opencode_db, b"not a database").unwrap();
+        let broken = scan(&providers, &mut cache);
+        assert!(!broken.errors.is_empty());
+        assert_eq!(broken.sessions, first.sessions, "nothing disappears because it could not be read");
+        fs::remove_file(&env.opencode_db).unwrap();
+        let gone = scan(&providers, &mut cache);
+        assert!(gone.sessions.is_empty() && gone.errors.is_empty(), "{:?}", gone.errors);
     }
 
     #[test]

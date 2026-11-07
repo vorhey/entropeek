@@ -7,6 +7,7 @@
 //! Then point entropeek at it:
 //!
 //!     HOME=/tmp/fake CLAUDE_CONFIG_DIR=/tmp/fake/.claude CODEX_HOME=/tmp/fake/.codex \
+//!       XDG_DATA_HOME=/tmp/fake/.local/share OPENCODE_DB= \
 //!       ENTROPEEK_CACHE_DIR=/tmp/fake/.cache ENTROPEEK_DATA_DIR=/tmp/fake/.data entropeek
 
 use std::path::PathBuf;
@@ -26,8 +27,8 @@ fn main() {
             println!("wrote {count} synthetic sessions ({turns} turns each) under {}", root.display());
         }
         None => {
-            let ids = testkit::populate(&env);
-            println!("wrote {} sessions under {}", ids.len(), root.display());
+            let count = testkit::populate(&env).len() + testkit::opencode::sample(&env).len();
+            println!("wrote {count} sessions under {}", root.display());
         }
     }
 }

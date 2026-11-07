@@ -58,7 +58,7 @@ Match the code layout:
 | `theme` | colors and light/dark detection |
 | `icons` | Nerd Font icons and their detection |
 | `cli` | commands and their output |
-| `claude`, `codex` | an agent's parser (`src/provider/`) |
+| `claude`, `codex`, `opencode` | an agent's parser (`src/provider/`) |
 | `index`, `cache` | scanning and the session cache |
 | `trash` | delete, restore and purge |
 | `search` | search and session selectors |

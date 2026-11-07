@@ -358,6 +358,39 @@ fn codex_subagents_are_part_of_their_session() {
     assert_eq!(home.json(&["list", "--json"]).as_array().unwrap().len(), 4);
 }
 
+#[test]
+fn opencode_sessions_list_show_resume_and_are_never_deleted() {
+    let home = Home::new();
+    let ids = testkit::opencode::sample(&home.env);
+    let db = &home.env.opencode_db;
+    let before = std::fs::read(db).unwrap();
+
+    let listed = home.json(&["list", "--json", "--agent", "opencode"]);
+    let got: Vec<&str> = listed.as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    assert_eq!(got, ids);
+    assert_eq!(listed[0]["title"], "Cache the API responses");
+    assert_eq!(listed[1]["title"], serde_json::Value::Null, "untitled falls back to the first prompt");
+    assert_eq!(home.json(&["list", "--json"]).as_array().unwrap().len(), 6, "listed with the other agents");
+    assert!(home.ok(&["list"]).contains("opencode"), "the agent column fits the name");
+    // The second run reads the cache and gives the same answer.
+    assert_eq!(home.json(&["list", "--json", "--agent", "opencode"]), listed);
+
+    let out = home.ok(&["show", &format!("opencode:{}", ids[0])]);
+    assert!(out.contains("OpenCode · Cache the API responses"), "{out}");
+    assert!(out.contains("cache the slow api responses") && out.contains("Adding an LRU cache."), "{out}");
+    assert!(out.contains("read: /work/app/src/api.rs"), "{out}");
+    let line = home.ok(&["resume", &ids[0], "--print"]);
+    assert_eq!(line.trim(), format!("cd /work/app && opencode --session {}", ids[0]));
+
+    // Refused before asking, with or without --yes.
+    for args in [vec!["delete", &ids[0]], vec!["delete", &ids[0], "--yes"]] {
+        let err = home.fails(&args);
+        assert!(err.contains(&format!("opencode session delete {}", ids[0])), "{err}");
+    }
+    assert_eq!(std::fs::read(db).unwrap(), before, "the database is never written");
+    assert_eq!(home.json(&["list", "--json", "--agent", "opencode"]).as_array().unwrap().len(), 2);
+}
+
 fn write_script(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     #[cfg(unix)]

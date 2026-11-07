@@ -19,7 +19,9 @@ pub fn delete(providers: &[Box<dyn Provider>], trash: &Trash, session: &Session)
 
 /// Puts a trashed session back. Its files must belong inside an agent directory.
 pub fn restore(providers: &[Box<dyn Provider>], trash: &Trash, key: &str) -> Result<TrashEntry> {
-    let roots: Vec<PathBuf> = providers.iter().map(|p| p.root().to_path_buf()).collect();
+    // Only agents whose sessions can be trashed have files to put back.
+    let roots: Vec<PathBuf> =
+        providers.iter().filter(|p| p.kind().can_delete()).map(|p| p.root().to_path_buf()).collect();
     trash.restore(key, &roots)
 }
 

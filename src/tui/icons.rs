@@ -76,6 +76,7 @@ pub mod glyph {
     pub const USER: &str = "\u{f007}"; // nf-fa-user
     pub const ROBOT: &str = "\u{f06a9}"; // nf-md-robot
     pub const CODE: &str = "\u{f121}"; // nf-fa-code
+    pub const BRACES: &str = "\u{f0169}"; // nf-md-code_braces
     pub const WRENCH: &str = "\u{f0ad}"; // nf-fa-wrench
     pub const SEARCH: &str = "\u{f002}"; // nf-fa-search
     pub const LIST: &str = "\u{f03a}"; // nf-fa-list
@@ -91,6 +92,7 @@ pub fn agent(agent: AgentKind) -> &'static str {
     match agent {
         AgentKind::Claude => glyph::ROBOT,
         AgentKind::Codex => glyph::CODE,
+        AgentKind::OpenCode => glyph::BRACES,
     }
 }
 
@@ -738,8 +740,16 @@ mod tests {
     #[test]
     fn glyphs_are_one_cell_wide() {
         use unicode_width::UnicodeWidthStr;
-        for glyph in [glyph::FOLDER, glyph::BRANCH, glyph::ROBOT, glyph::CODE, glyph::WRENCH, glyph::USER, glyph::LOGO]
-        {
+        for glyph in [
+            glyph::FOLDER,
+            glyph::BRANCH,
+            glyph::ROBOT,
+            glyph::CODE,
+            glyph::BRACES,
+            glyph::WRENCH,
+            glyph::USER,
+            glyph::LOGO,
+        ] {
             assert_eq!(glyph.width(), 1, "{glyph:?}");
         }
     }

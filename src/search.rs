@@ -37,7 +37,7 @@ pub enum Selector {
     /// The most recently updated session.
     Latest,
     /// An exact id or a unique id prefix (4+ characters), optionally
-    /// limited to one agent with `claude:<id>` / `codex:<id>`.
+    /// limited to one agent with `claude:<id>` / `codex:<id>` / `opencode:<id>`.
     Id { agent: Option<AgentKind>, id: String },
     /// The session file itself (any argument containing `/`).
     Path(PathBuf),

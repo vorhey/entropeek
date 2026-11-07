@@ -193,8 +193,7 @@ const GUTTER: usize = 2;
 
 fn columns(width: usize, with_workspace: bool, icons: bool) -> Columns {
     let inner = width.saturating_sub(GUTTER);
-    // ` CLAUDE `, or ` 󰚩 CLAUDE ` with icons.
-    let (mut agent, mut updated) = (if icons { 10 } else { 8 }, 8);
+    let (mut agent, mut updated) = (agent_cells(icons), 8);
     if inner < agent + updated + 2 + 10 {
         agent = agent.min((inner / 5).max(3));
         updated = updated.min((inner / 4).max(5));
@@ -229,7 +228,8 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let message = if app.sessions.is_empty() && app.scanning {
             "scanning sessions…".to_string()
         } else if app.sessions.is_empty() {
-            "No sessions found. entropeek reads ~/.claude/projects and ~/.codex/sessions.".to_string()
+            "No sessions found. entropeek reads ~/.claude/projects, ~/.codex/sessions and OpenCode's database."
+                .to_string()
         } else if !app.query.trim().is_empty() {
             format!("No sessions match \"{}\"", app.query.trim())
         } else {
@@ -284,6 +284,12 @@ fn group_line(app: &App, cwd: &str, count: usize, collapsed: bool, selected: boo
     Line::from(Span::styled(line, style))
 }
 
+/// Room for the longest agent badge: ` OPENCODE `, or ` 󰅩 OPENCODE `
+/// with icons.
+fn agent_cells(icons: bool) -> usize {
+    AgentKind::longest_id() + if icons { 4 } else { 2 }
+}
+
 /// The agent's name, centered in `cells`: ` CLAUDE `, or ` CL ` when
 /// narrow; with icons ` 󰚩 CLAUDE `, or just the icon when narrow.
 fn agent_label(agent: AgentKind, cells: usize, icons: bool) -> String {
@@ -295,6 +301,7 @@ fn agent_label(agent: AgentKind, cells: usize, icons: bool) -> String {
         let short = match agent {
             AgentKind::Claude => "CL",
             AgentKind::Codex => "CX",
+            AgentKind::OpenCode => "OC",
         };
         (name, short.to_string())
     };
@@ -409,7 +416,7 @@ fn meta_lines(app: &App, session: &Session, width: usize) -> Vec<Line<'static>> 
         ]),
         fit(vec![
             label("session"),
-            Span::styled(agent_label(session.agent, if t.icons { 10 } else { 8 }, t.icons), t.badge(session.agent)),
+            Span::styled(agent_label(session.agent, agent_cells(t.icons), t.icons), t.badge(session.agent)),
             Span::styled(format!(" {}", text::one_line(&session.id)), t.text()),
         ]),
         fit(vec![
@@ -682,7 +689,10 @@ fn key_groups(app: &App) -> [Vec<KeyHint>; 4] {
             KeyHint { key: "w", desc: "groups", value: on_off(app.grouped) },
         ]
     };
-    let agents = if app.agent_counts().len() > 1 { "1-2" } else { "1" };
+    // Digit keys follow `AgentKind::ALL` (as do the counts): name them up
+    // to the last agent listed.
+    let last = app.agent_counts().last().and_then(|&(agent, ..)| AgentKind::ALL.iter().position(|a| *a == agent));
+    let agents = ["1", "1-2", "1-3"].get(last.unwrap_or(0)).copied().unwrap_or("1-9");
     let theme = Some(match app.theme.mode {
         super::theme::Mode::Dark => "dark",
         super::theme::Mode::Light => "light",
@@ -947,12 +957,12 @@ mod tests {
             lines(&buffer)[0]
         );
         assert_eq!(buffer[(0, 0)].fg, Theme::light().brand, "the logo too");
-        assert!(screen.contains("  AGENT    UPDATED  TITLE"), "column header");
+        assert!(screen.contains("  AGENT      UPDATED  TITLE"), "column header");
         assert!(screen.contains("▾ ~/app (2)"));
         assert!(screen.contains("▾ ~/site (1)"));
-        assert!(screen.contains("❯  CLAUDE  1h ago   Rate limiting for API"), "{screen}");
-        assert!(screen.contains("   CODEX   2d ago   Review rate limiter"));
-        assert!(screen.contains("   CLAUDE  3d ago   Landing page"));
+        assert!(screen.contains("❯   CLAUDE   1h ago   Rate limiting for API"), "{screen}");
+        assert!(screen.contains("    CODEX    2d ago   Review rate limiter"), "{screen}");
+        assert!(screen.contains("    CLAUDE   3d ago   Landing page"), "{screen}");
     }
 
     #[test]
@@ -992,7 +1002,7 @@ mod tests {
         has(format!("{} main", glyph::BRANCH));
         has("i icons on".to_string());
         // Rows stay aligned with the column header.
-        assert!(screen.contains("  AGENT      UPDATED  TITLE"), "{screen}");
+        assert!(screen.contains("  AGENT        UPDATED  TITLE"), "{screen}");
         // Narrow badges become just the icon.
         let narrow = self::screen(&mut app, 24, 12);
         assert!(narrow.contains(&format!(" {} ", glyph::CODE)), "{narrow}");
@@ -1140,6 +1150,27 @@ mod tests {
     }
 
     #[test]
+    fn agent_keys_and_badges_cover_opencode() {
+        let screen = screen(&mut app(), 120, 30);
+        assert!(screen.contains("1-2   agents"), "{screen}");
+        let mut app = App::new(
+            vec![
+                session(AgentKind::Claude, "a1", "/home/u/app", NOW - 3_600_000, "Rate limiting for API"),
+                session(AgentKind::OpenCode, "ses_1", "/home/u/app", NOW - 7_200_000, "Cache responses"),
+            ],
+            "/home/u".into(),
+            NOW,
+            Box::new(|s| format!("opencode --session {}", s.id)),
+        );
+        let screen = self::screen(&mut app, 120, 30);
+        assert!(screen.contains("1-3   agents"), "digits follow the agents' order: {screen}");
+        assert!(screen.contains("3 opencode 1"), "{screen}");
+        assert!(screen.contains(" OPENCODE  2h ago   Cache responses"), "the full name fits: {screen}");
+        let narrow = self::screen(&mut app, 24, 12);
+        assert!(narrow.contains(" OC "), "{narrow}");
+    }
+
+    #[test]
     fn keys_box_colors() {
         let mut app = app();
         let buffer = render(&mut app, 120, 30);
@@ -1222,7 +1253,7 @@ mod tests {
         let screen = lines(&buffer).join("\n");
         assert!(screen.contains("╭─ Conversation ─"), "{screen}");
         assert!(screen.contains("workspace  ~/app · ⎇ main"), "{screen}");
-        assert!(screen.contains("session     CLAUDE  a1"));
+        assert!(screen.contains("session      CLAUDE   a1"), "{screen}");
         assert!(screen.contains("command    claude --resume a1"));
         assert!(screen.contains("▍You"));
         assert!(screen.contains("please add rate limiting"));
@@ -1428,8 +1459,8 @@ mod tests {
 
     #[test]
     fn columns_follow_showagent() {
-        assert_eq!(columns(100, false, false), Columns { agent: 8, updated: 8, workspace: 0, title: 80 });
-        assert_eq!(columns(100, true, false), Columns { agent: 8, updated: 8, workspace: 32, title: 47 });
+        assert_eq!(columns(100, false, false), Columns { agent: 10, updated: 8, workspace: 0, title: 78 });
+        assert_eq!(columns(100, true, false), Columns { agent: 10, updated: 8, workspace: 32, title: 45 });
         assert_eq!(columns(24, true, false), Columns { agent: 4, updated: 5, workspace: 0, title: 11 });
         for width in 24..220 {
             for with_workspace in [false, true] {

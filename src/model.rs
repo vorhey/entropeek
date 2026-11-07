@@ -9,17 +9,19 @@ use serde::{Deserialize, Serialize};
 pub enum AgentKind {
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl AgentKind {
     /// Every supported agent, in display order. Digit keys in the TUI follow this order.
-    pub const ALL: [AgentKind; 2] = [AgentKind::Claude, AgentKind::Codex];
+    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::OpenCode];
 
     /// Stable lowercase id used on the command line and in JSON.
     pub fn id(self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::OpenCode => "opencode",
         }
     }
 
@@ -27,6 +29,7 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "Claude",
             AgentKind::Codex => "Codex",
+            AgentKind::OpenCode => "OpenCode",
         }
     }
 
@@ -35,7 +38,32 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::OpenCode => "opencode",
         }
+    }
+
+    /// Why session `id` of this agent cannot be deleted, if it cannot.
+    /// OpenCode keeps sessions as rows in a database it may be writing to;
+    /// the trash only moves files, so deleting is left to OpenCode.
+    pub fn cannot_delete(self, id: &str) -> Option<String> {
+        match self {
+            AgentKind::OpenCode => Some(format!(
+                "OpenCode sessions are deleted in OpenCode: opencode session delete {} \
+                 (entropeek never writes to its database)",
+                crate::text::one_line(id)
+            )),
+            AgentKind::Claude | AgentKind::Codex => None,
+        }
+    }
+
+    /// Whether entropeek can delete this agent's sessions.
+    pub fn can_delete(self) -> bool {
+        self.cannot_delete("").is_none()
+    }
+
+    /// The length of the longest [`AgentKind::id`], for sizing columns.
+    pub fn longest_id() -> usize {
+        AgentKind::ALL.iter().map(|agent| agent.id().len()).max().unwrap_or(0)
     }
 
     pub fn from_id(value: &str) -> Option<AgentKind> {
@@ -141,6 +169,7 @@ mod tests {
             assert_eq!(AgentKind::from_id(agent.id()), Some(agent));
         }
         assert_eq!(AgentKind::from_id("CLAUDE"), Some(AgentKind::Claude));
+        assert_eq!(AgentKind::from_id("OpenCode"), Some(AgentKind::OpenCode));
         assert_eq!(AgentKind::from_id("gemini"), None);
     }
 

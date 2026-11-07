@@ -3,12 +3,12 @@ name = "entropeek"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
-description = "A fast terminal UI to browse, preview, resume and delete coding-agent sessions (Claude Code, Codex)"
+description = "A fast terminal UI to browse, preview, resume and delete coding-agent sessions (Claude Code, Codex, OpenCode)"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/vorhey/entropeek"
 homepage = "https://github.com/vorhey/entropeek"
-keywords = ["tui", "claude", "codex", "sessions", "ratatui"]
+keywords = ["tui", "claude", "codex", "opencode", "sessions"]
 categories = ["command-line-utilities"]
 
 [[bin]]
@@ -24,6 +24,7 @@ memchr = "2.8"
 postcard = { version = "1.1", features = ["use-std"] }
 ratatui = "0.30"
 rayon = "1.12"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
 tempfile = "3.27"

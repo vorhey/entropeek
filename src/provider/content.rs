@@ -177,7 +177,8 @@ pub fn tool_summary(name: &str, input: Option<&RawValue>) -> String {
     with_detail(name, detail.as_deref())
 }
 
-fn with_detail(name: &str, detail: Option<&str>) -> String {
+/// `name: detail`, or just `name` when the detail has nothing printable.
+pub(crate) fn with_detail(name: &str, detail: Option<&str>) -> String {
     match detail.map(|d| text::summary(d, 120)).filter(|d| !d.is_empty()) {
         Some(detail) => format!("{name}: {detail}"),
         None => name.to_string(),

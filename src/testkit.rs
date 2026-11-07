@@ -314,6 +314,133 @@ pub mod codex {
     }
 }
 
+pub mod opencode {
+    use super::*;
+    use rusqlite::{Connection, params};
+
+    /// The tables entropeek reads, as OpenCode creates them.
+    const SCHEMA: &str = "
+        CREATE TABLE `session_v2` (
+          `id` text PRIMARY KEY, `project_id` text NOT NULL, `workspace_id` text, `parent_id` text,
+          `fork_session_id` text, `fork_boundary` text, `slug` text NOT NULL, `directory` text NOT NULL,
+          `path` text, `title` text, `version` text NOT NULL, `time_created` integer NOT NULL,
+          `time_updated` integer NOT NULL, `time_archived` integer
+        );
+        CREATE TABLE `session_message` (
+          `id` text PRIMARY KEY, `session_id` text NOT NULL, `type` text NOT NULL, `seq` integer NOT NULL,
+          `time_created` integer NOT NULL, `time_updated` integer NOT NULL, `data` text NOT NULL
+        );
+        CREATE TABLE `session_part` (
+          `message_id` text NOT NULL, `session_id` text NOT NULL, `ordinal` integer NOT NULL,
+          `type` text NOT NULL, `call_id` text, `time_created` integer NOT NULL,
+          `time_updated` integer NOT NULL, `data` text NOT NULL,
+          CONSTRAINT `session_part_pk` PRIMARY KEY(`message_id`, `ordinal`)
+        );
+        CREATE UNIQUE INDEX `session_message_session_seq_idx` ON `session_message` (`session_id`,`seq`);
+        CREATE INDEX `session_message_session_type_seq_idx` ON `session_message` (`session_id`,`type`,`seq`);
+        CREATE INDEX `session_part_session_message_idx` ON `session_part` (`session_id`,`message_id`,`ordinal`);";
+
+    /// Creates an empty OpenCode database at `db`, in WAL mode like OpenCode's.
+    pub fn create(db: &Path) {
+        fs::create_dir_all(db.parent().expect("db has a parent")).expect("create dirs");
+        let conn = Connection::open(db).expect("create db");
+        conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
+        conn.execute_batch(SCHEMA).expect("schema");
+    }
+
+    pub fn connect(db: &Path) -> Connection {
+        Connection::open(db).expect("open db")
+    }
+
+    pub fn session(conn: &Connection, id: &str, directory: &str, title: Option<&str>, created: i64, updated: i64) {
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?1, 'p', 'slug', ?2, ?3, '2.2.6', ?4, ?5)",
+            params![id, directory, title, created, updated],
+        )
+        .expect("insert session");
+    }
+
+    /// Adds a message and returns its id.
+    pub fn message(conn: &Connection, session: &str, seq: i64, kind: &str, data: Value) -> String {
+        let id = format!("msg_{session}_{seq}");
+        let created = data.pointer("/time/created").and_then(Value::as_i64).unwrap_or(0);
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+            params![id, session, kind, seq, created, data.to_string()],
+        )
+        .expect("insert message");
+        id
+    }
+
+    /// Adds an assistant part moved out of message `message_id`.
+    pub fn part(conn: &Connection, session: &str, message_id: &str, ordinal: i64, data: Value) {
+        let kind = data["type"].as_str().unwrap_or("text").to_string();
+        conn.execute(
+            "INSERT INTO session_part (message_id, session_id, ordinal, type, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+            params![message_id, session, ordinal, kind, data.to_string()],
+        )
+        .expect("insert part");
+    }
+
+    pub fn user(created: i64, text: &str) -> Value {
+        json!({"time": {"created": created}, "text": text, "files": [], "agents": []})
+    }
+
+    pub fn assistant(created: i64, content: Value) -> Value {
+        json!({
+            "time": {"created": created, "completed": created + 1},
+            "agent": "build",
+            "model": {"id": "some-model", "providerID": "some-provider"},
+            "content": content,
+        })
+    }
+
+    pub fn text(text: &str) -> Value {
+        json!({"type": "text", "text": text})
+    }
+
+    pub fn tool(name: &str, input: Value) -> Value {
+        json!({
+            "type": "tool", "id": "call_1", "name": name,
+            "state": {"status": "completed", "input": input, "content": [{"type": "text", "text": "output"}]},
+            "time": {"created": 0, "completed": 1},
+        })
+    }
+
+    /// Two OpenCode sessions in `env`'s OpenCode database, for trying
+    /// entropeek out. Returns their ids, newest first.
+    pub fn sample(env: &crate::env::Env) -> Vec<String> {
+        let ms = |ts: &str| crate::timefmt::parse_rfc3339_ms(ts).expect("timestamp");
+        create(&env.opencode_db);
+        let conn = connect(&env.opencode_db);
+        let (a, b) = ("ses_0a1b2c3d4e5fOpenCodeSample1", "ses_0a1b2c3d4e5fOpenCodeSample2");
+        session(
+            &conn,
+            a,
+            "/work/app",
+            Some("Cache the API responses"),
+            ms("2026-10-05T08:00:00Z"),
+            ms("2026-10-05T08:05:00Z"),
+        );
+        message(&conn, a, 1, "user", user(ms("2026-10-05T08:00:00Z"), "cache the slow api responses"));
+        let reply = json!([text("Adding an LRU cache."), tool("read", json!({"path": "/work/app/src/api.rs"}))]);
+        message(&conn, a, 2, "assistant", assistant(ms("2026-10-05T08:00:05Z"), reply));
+        session(&conn, b, "/work/site", None, ms("2026-09-30T12:00:00Z"), ms("2026-09-30T12:10:00Z"));
+        message(&conn, b, 1, "user", user(ms("2026-09-30T12:00:00Z"), "why is the build slow?"));
+        message(
+            &conn,
+            b,
+            2,
+            "assistant",
+            assistant(ms("2026-09-30T12:00:09Z"), json!([text("Checking the bundler.")])),
+        );
+        vec![a.into(), b.into()]
+    }
+}
+
 /// A small, varied set of sessions under `env`'s agent directories:
 /// two Claude sessions in one workspace, one in another, and one Codex session.
 /// Returns the session ids, newest first.
